@@ -85,7 +85,8 @@ Important limits:
 - Interactive: `codex-auth switch`
 - Non-interactive: `codex-auth switch <email>`
 
-For non-interactive switching, the target account is matched by email case-insensitively against the registry.
+For non-interactive switching, the target account is matched by email case-insensitively using fragment/prefix matching.
+If multiple accounts match, interactive selection is shown.
 
 When switching:
 

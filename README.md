@@ -12,7 +12,7 @@ This project provides a single Zig tool: `codex-auth`, a local-only ChatGPT acco
 ```shell
 codex-auth list # list all accounts
 codex-auth add [--no-login] # add current account (runs `codex login` by default)
-codex-auth switch <email> # switch active account (interactive or non-interactive)
+codex-auth switch [<email>] # switch active account (interactive or partial/fragment match)
 codex-auth import <path> [--name <name>] # smart import: file -> single import, folder -> batch import
 codex-auth remove # remove accounts (interactive multi-select)
 ```
@@ -55,8 +55,9 @@ codex-auth switch               # arrow + number input
 Switch account non-interactively (for scripts/other CLIs):
 
 ```shell
-codex-auth switch user@example.com
+codex-auth switch user
 ```
+If multiple accounts match, interactive selection is shown.
 
 Remove accounts (interactive multi-select):
 

@@ -99,16 +99,20 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
 
     var selected_email: ?[]const u8 = null;
     if (opts.email) |target_email| {
-        for (reg.accounts.items) |rec| {
-            if (std.ascii.eqlIgnoreCase(rec.email, target_email)) {
-                selected_email = rec.email;
-                break;
-            }
-        }
-        if (selected_email == null) {
+        var matches = try findMatchingAccounts(allocator, &reg, target_email);
+        defer matches.deinit(allocator);
+
+        if (matches.items.len == 0) {
             std.log.err("account not found: {s}", .{target_email});
             return error.AccountNotFound;
         }
+
+        if (matches.items.len == 1) {
+            selected_email = reg.accounts.items[matches.items[0]].email;
+        } else {
+            selected_email = try cli.selectAccountFromIndices(allocator, &reg, matches.items);
+        }
+        if (selected_email == null) return;
     } else {
         const selected = try cli.selectAccount(allocator, &reg);
         if (selected == null) return;
@@ -127,6 +131,20 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
 
     try registry.setActiveAccount(allocator, &reg, email);
     try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+fn findMatchingAccounts(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    query: []const u8,
+) !std.ArrayList(usize) {
+    var matches = std.ArrayList(usize).empty;
+    for (reg.accounts.items, 0..) |*rec, idx| {
+        if (std.ascii.indexOfIgnoreCase(rec.email, query) != null) {
+            try matches.append(allocator, idx);
+        }
+    }
+    return matches;
 }
 
 fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8) !void {

@@ -134,7 +134,7 @@ pub fn printHelp() !void {
         "  list\n" ++
         "  add [--no-login]\n" ++
         "  import <path> [--name <name>]\n" ++
-        "  switch [<email>]\n" ++
+        "  switch [<email-prefix-or-part>]\n" ++
         "  remove\n"
     );
     try out.flush();
@@ -154,6 +154,15 @@ pub fn selectAccount(allocator: std.mem.Allocator, reg: *registry.Registry) !?[]
         selectWithNumbers(reg)
     else
         selectInteractive(allocator, reg) catch selectWithNumbers(reg);
+}
+
+pub fn selectAccountFromIndices(allocator: std.mem.Allocator, reg: *registry.Registry, indices: []const usize) !?[]const u8 {
+    if (indices.len == 0) return null;
+    if (indices.len == 1) return reg.accounts.items[indices[0]].email;
+    return if (comptime builtin.os.tag == .windows)
+        selectWithNumbersFromIndices(allocator, reg, indices)
+    else
+        selectInteractiveFromIndices(allocator, reg, indices) catch selectWithNumbersFromIndices(allocator, reg, indices);
 }
 
 pub fn selectAccountsToRemove(allocator: std.mem.Allocator, reg: *registry.Registry) !?[]usize {
@@ -199,6 +208,141 @@ fn selectWithNumbers(reg: *registry.Registry) !?[]const u8 {
     const idx = std.fmt.parseInt(usize, line, 10) catch return null;
     if (idx == 0 or idx > reg.accounts.items.len) return null;
     return reg.accounts.items[idx - 1].email;
+}
+
+fn selectWithNumbersFromIndices(allocator: std.mem.Allocator, reg: *registry.Registry, indices: []const usize) !?[]const u8 {
+    var stdout: io_util.Stdout = undefined;
+    stdout.init();
+    const out = stdout.out();
+    if (indices.len == 0) return null;
+
+    var rows = try buildSwitchRowsFromIndices(allocator, reg, indices);
+    defer rows.deinit(allocator);
+    const use_color = colorEnabled();
+    const active_idx = activeCandidateIndex(reg, indices);
+    const idx_width = @max(@as(usize, 2), indexWidth(indices.len));
+    const widths = rows.widths;
+
+    try out.writeAll("Select account to activate:\n\n");
+    try renderSwitchList(out, reg, rows.items, idx_width, widths, active_idx, use_color);
+    try out.writeAll("Select account number: ");
+    try out.flush();
+
+    var buf: [64]u8 = undefined;
+    const n = try std.fs.File.stdin().read(&buf);
+    const line = std.mem.trim(u8, buf[0..n], " \n\r\t");
+    if (line.len == 0) {
+        if (active_idx) |i| return reg.accounts.items[indices[i]].email;
+        return null;
+    }
+    const idx = std.fmt.parseInt(usize, line, 10) catch return null;
+    if (idx == 0 or idx > indices.len) return null;
+    return reg.accounts.items[indices[idx - 1]].email;
+}
+
+fn selectInteractiveFromIndices(allocator: std.mem.Allocator, reg: *registry.Registry, indices: []const usize) !?[]const u8 {
+    if (indices.len == 0) return null;
+    var rows = try buildSwitchRowsFromIndices(allocator, reg, indices);
+    defer rows.deinit(allocator);
+
+    var tty = try std.fs.cwd().openFile("/dev/tty", .{});
+    defer tty.close();
+
+    const term = try std.posix.tcgetattr(tty.handle);
+    var raw = term;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
+    try std.posix.tcsetattr(tty.handle, .FLUSH, raw);
+    defer std.posix.tcsetattr(tty.handle, .FLUSH, term) catch {};
+
+    var stdout: io_util.Stdout = undefined;
+    stdout.init();
+    const out = stdout.out();
+    const active_idx = activeCandidateIndex(reg, indices);
+    var idx: usize = active_idx orelse 0;
+    var number_buf: [8]u8 = undefined;
+    var number_len: usize = 0;
+    const use_color = colorEnabled();
+    const idx_width = @max(@as(usize, 2), indexWidth(indices.len));
+    const widths = rows.widths;
+
+    while (true) {
+        try out.writeAll("\x1b[2J\x1b[H");
+        try out.writeAll("Select account to activate:\n\n");
+        try renderSwitchList(out, reg, rows.items, idx_width, widths, idx, use_color);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.dim);
+        try out.writeAll("Keys: ↑/↓ or j/k, Enter select, 1-9 type, Backspace edit, Esc exit\n");
+        if (use_color) try out.writeAll(ansi.reset);
+        try out.flush();
+
+        var b: [8]u8 = undefined;
+        const n = try tty.read(&b);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                if (i + 2 < n and b[i + 1] == '[') {
+                    const code = b[i + 2];
+                    if (code == 'A' and idx > 0) {
+                        idx -= 1;
+                        number_len = 0;
+                    } else if (code == 'B' and idx + 1 < indices.len) {
+                        idx += 1;
+                        number_len = 0;
+                    }
+                    i += 2;
+                    continue;
+                }
+                return null;
+            }
+
+            if (b[i] == '\r' or b[i] == '\n') {
+                if (number_len > 0) {
+                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                    if (parsed >= 1 and parsed <= indices.len) {
+                        return reg.accounts.items[indices[parsed - 1]].email;
+                    }
+                }
+                return reg.accounts.items[indices[idx]].email;
+            }
+
+            if (b[i] == 'k' and idx > 0) {
+                idx -= 1;
+                number_len = 0;
+                continue;
+            }
+            if (b[i] == 'j' and idx + 1 < indices.len) {
+                idx += 1;
+                number_len = 0;
+                continue;
+            }
+            if (b[i] == 0x7f or b[i] == 0x08) {
+                if (number_len > 0) {
+                    number_len -= 1;
+                    if (number_len > 0) {
+                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                        if (parsed >= 1 and parsed <= indices.len) {
+                            idx = parsed - 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            if (b[i] >= '0' and b[i] <= '9') {
+                if (number_len < number_buf.len) {
+                    number_buf[number_len] = b[i];
+                    number_len += 1;
+                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                    if (parsed >= 1 and parsed <= indices.len) {
+                        idx = parsed - 1;
+                    }
+                }
+                continue;
+            }
+        }
+    }
 }
 
 fn selectRemoveWithNumbers(allocator: std.mem.Allocator, reg: *registry.Registry) !?[]usize {
@@ -708,6 +852,57 @@ fn buildSwitchRows(allocator: std.mem.Allocator, reg: *registry.Registry) !Switc
     }
     if (widths.email > 32) widths.email = 32;
     return SwitchRows{ .items = rows, .widths = widths };
+}
+
+fn buildSwitchRowsFromIndices(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    indices: []const usize,
+) !SwitchRows {
+    const count = indices.len;
+    var rows = try allocator.alloc(SwitchRow, count);
+    var widths = SwitchWidths{
+        .email = "EMAIL".len,
+        .plan = "PLAN".len,
+        .rate_5h = "5H".len,
+        .rate_week = "WEEKLY".len,
+        .last = "LAST".len,
+    };
+    const now = std.time.timestamp();
+    for (indices, 0..) |source_idx, i| {
+        const rec = reg.accounts.items[source_idx];
+        const email = rec.email;
+        const plan = if (registry.resolvePlan(&rec)) |p| @tagName(p) else "-";
+        const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
+        const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
+        const rate_5h_str = try formatRateLimitSwitchAlloc(allocator, rate_5h);
+        const rate_week_str = try formatRateLimitSwitchAlloc(allocator, rate_week);
+        const last = try timefmt.formatRelativeTimeOrDashAlloc(allocator, rec.last_usage_at, now);
+        rows[i] = .{
+            .email = email,
+            .plan = plan,
+            .rate_5h = rate_5h_str,
+            .rate_week = rate_week_str,
+            .last = last,
+            .is_active = if (reg.active_email) |k| std.mem.eql(u8, k, rec.email) else false,
+        };
+        widths.email = @max(widths.email, email.len);
+        widths.plan = @max(widths.plan, plan.len);
+        widths.rate_5h = @max(widths.rate_5h, rate_5h_str.len);
+        widths.rate_week = @max(widths.rate_week, rate_week_str.len);
+        widths.last = @max(widths.last, last.len);
+    }
+    if (widths.email > 32) widths.email = 32;
+    return SwitchRows{ .items = rows, .widths = widths };
+}
+
+fn activeCandidateIndex(reg: *registry.Registry, indices: []const usize) ?usize {
+    if (reg.active_email) |active| {
+        for (indices, 0..) |source_idx, position| {
+            if (std.mem.eql(u8, reg.accounts.items[source_idx].email, active)) return position;
+        }
+    }
+    return null;
 }
 
 fn resolveRateWindow(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_primary: bool) ?registry.RateLimitWindow {
