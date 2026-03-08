@@ -21,10 +21,6 @@ npm install -g @loongphy/codex-auth
 npx @loongphy/codex-auth list
 ```
 
-  The npm package uses npm's platform-aware install model: the root package depends on platform packages via `optionalDependencies`, and npm installs the matching binary package for your current OS/CPU.
-  Supported npm targets: Linux x64, macOS ARM64, Windows x64.
-  Tag publishing uses npm Trusted Publishing via GitHub Actions OIDC from `.github/workflows/release.yml`.
-
 - Linux/macOS/WSL2:
 
 ```shell
