@@ -21,6 +21,7 @@
   ],
   "optionalDependencies": {
     "@loongphy/codex-auth-linux-x64": "0.1.4",
+    "@loongphy/codex-auth-darwin-x64": "0.1.4",
     "@loongphy/codex-auth-darwin-arm64": "0.1.4",
     "@loongphy/codex-auth-win32-x64": "0.1.4"
   },

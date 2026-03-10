@@ -45,6 +45,10 @@ jobs:
             zig_target: x86_64-linux-gnu
             binary_name: codex-auth
             archive_name: codex-auth-Linux-X64.tar.gz
+          - id: darwin-x64
+            zig_target: x86_64-macos-none
+            binary_name: codex-auth
+            archive_name: codex-auth-macOS-X64.tar.gz
           - id: darwin-arm64
             zig_target: aarch64-macos-none
             binary_name: codex-auth
@@ -249,6 +253,7 @@ jobs:
         run: |
           for dir in \
             codex-auth-linux-x64 \
+            codex-auth-darwin-x64 \
             codex-auth-darwin-arm64 \
             codex-auth-win32-x64
           do

@@ -21,6 +21,8 @@ npm install -g @loongphy/codex-auth
 npx @loongphy/codex-auth list
 ```
 
+  npm packages currently support Linux x64, macOS x64, macOS arm64, and Windows x64.
+
 - Linux/macOS/WSL2:
 
 ```shell

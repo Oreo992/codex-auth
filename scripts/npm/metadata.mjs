@@ -26,6 +26,16 @@ export const platformPackages = [
     zigTarget: "x86_64-linux-gnu"
   },
   {
+    id: "darwin-x64",
+    packageName: "@loongphy/codex-auth-darwin-x64",
+    packageDirName: "codex-auth-darwin-x64",
+    os: "darwin",
+    cpu: "x64",
+    binaryName: "codex-auth",
+    archiveName: "codex-auth-macOS-X64.tar.gz",
+    zigTarget: "x86_64-macos-none"
+  },
+  {
     id: "darwin-arm64",
     packageName: "@loongphy/codex-auth-darwin-arm64",
     packageDirName: "codex-auth-darwin-arm64",
