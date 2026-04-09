@@ -45,17 +45,18 @@ This document describes the repository's CI, preview package publishing, and tag
 
 ## npm Package Layout
 
-- npm distribution uses one root package plus five platform packages.
+- npm distribution uses one root package plus six platform packages.
 - Root package: `@loongphy/codex-auth`
 - Platform packages:
   - `@loongphy/codex-auth-linux-x64`
+  - `@loongphy/codex-auth-linux-arm64`
   - `@loongphy/codex-auth-darwin-x64`
   - `@loongphy/codex-auth-darwin-arm64`
   - `@loongphy/codex-auth-win32-x64`
   - `@loongphy/codex-auth-win32-arm64`
 - The root package exposes the `codex-auth` command and depends on the platform packages through `optionalDependencies`.
 - Each platform package declares `os` and `cpu`, so npm installs only the matching binary package for the current host platform.
-- GitHub Release assets and npm packages currently target Linux x64, macOS x64, macOS ARM64, Windows x64, and Windows ARM64.
+- GitHub Release assets and npm packages currently target Linux x64, Linux ARM64, macOS x64, macOS ARM64, Windows x64, and Windows ARM64.
 - Windows builds include both `codex-auth.exe` and `codex-auth-auto.exe`; the helper is used only by the managed auto-switch task.
 
 ## CI Workflow
@@ -67,9 +68,9 @@ This document describes the repository's CI, preview package publishing, and tag
 ## Preview Packages for Pull Requests
 
 - Pull request preview npm packages are published by `.github/workflows/preview-release.yml`.
-- The workflow cross-builds the five platform binaries on Ubuntu and stages the same six npm package directories used by the tag release pipeline.
+- The workflow cross-builds the six platform binaries on Ubuntu and stages the same seven npm package directories used by the tag release pipeline.
 - The staged root preview package has its `optionalDependencies` rewritten to deterministic `pkg.pr.new` platform package URLs for the PR head SHA.
-- Preview publishing then runs a single `pkg.pr.new` publish command across the root package and all five platform packages, so the preview install command keeps the same platform-selective behavior as the real npm release.
+- Preview publishing then runs a single `pkg.pr.new` publish command across the root package and all six platform packages, so the preview install command keeps the same platform-selective behavior as the real npm release.
 - The staged preview root package also gets a `codexAuthPreviewLabel` field like `pr-6 b6bfcf5`.
 - The root CLI wrapper uses that field so `codex-auth --version` prints `codex-auth <version> (preview pr-6 b6bfcf5)` for preview installs only.
 - `.github/workflows/preview-release.yml` uses `actions/setup-node@v6` with `node-version: lts/*` so preview publishing tracks the latest Node LTS line automatically.
@@ -79,7 +80,7 @@ This document describes the repository's CI, preview package publishing, and tag
 
 - Tag pushes matching `v*` run `.github/workflows/release.yml`.
 - The release workflow first validates the code with the same `build-test` matrix used by CI.
-- It then cross-builds release assets for the five supported targets on Ubuntu.
+- It then cross-builds release assets for the six supported targets on Ubuntu.
 - Release notes are generated from git tags and commit history.
 - GitHub releases are published automatically from the tag pipeline.
 - Stable tags create normal GitHub releases.

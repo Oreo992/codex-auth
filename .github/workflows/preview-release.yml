@@ -17,6 +17,9 @@ jobs:
           - id: linux-x64
             zig_target: x86_64-linux-gnu
             binary_name: codex-auth
+          - id: linux-arm64
+            zig_target: aarch64-linux-gnu
+            binary_name: codex-auth
           - id: darwin-x64
             zig_target: x86_64-macos-none
             binary_name: codex-auth
@@ -96,6 +99,7 @@ jobs:
           npx pkg-pr-new publish --bin
           ./dist/npm/root
           ./dist/npm/codex-auth-linux-x64
+          ./dist/npm/codex-auth-linux-arm64
           ./dist/npm/codex-auth-darwin-x64
           ./dist/npm/codex-auth-darwin-arm64
           ./dist/npm/codex-auth-win32-x64
