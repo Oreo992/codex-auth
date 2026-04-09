@@ -10,6 +10,10 @@ After modifying any `.zig` file, always run `zig build run -- list` to verify th
 
 - Run tests, review commands, and other side-effecting tooling from an isolated directory under `/tmp/<task-name>` with `HOME=/tmp/<task-name>`.
 
+# Release Process
+
+- When updating and pushing a release version, always follow [docs/release.md](./docs/release.md).
+
 # Zig API Discovery
 
 - Do not guess Zig APIs from memory or from examples targeting other Zig versions.
