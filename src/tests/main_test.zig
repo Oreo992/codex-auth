@@ -331,6 +331,64 @@ test "Scenario: Given foreground usage refresh targets when checking refresh pol
     try std.testing.expect(!main_mod.shouldRefreshForegroundUsage(.remove_account));
 }
 
+test "Scenario: Given list with missing team names when running foreground account-name refresh then it waits and saves the updated names" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+    try appendAccount(gpa, &reg, primary_record_key, "user@example.com", "", .team);
+    try appendAccount(gpa, &reg, secondary_record_key, "user@example.com", "", .team);
+    try registry.setActiveAccountKey(gpa, &reg, primary_record_key);
+    try writeActiveAuthWithIds(gpa, codex_home, "user@example.com", "team", shared_user_id, primary_account_id);
+
+    resetMockAccountNameFetcher();
+    expected_mock_account_name_fetch_account_id = primary_account_id;
+    try main_mod.maybeRefreshForegroundAccountNames(gpa, codex_home, &reg, .list, mockAccountNameFetcher);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_account_name_fetch_count);
+    try std.testing.expectEqualStrings("Primary Workspace", reg.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", reg.accounts.items[1].account_name.?);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[1].account_name.?);
+}
+
+test "Scenario: Given switch with missing team names when running foreground account-name refresh then it waits and saves the updated names" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+    try appendAccount(gpa, &reg, primary_record_key, "user@example.com", "", .team);
+    try appendAccount(gpa, &reg, secondary_record_key, "user@example.com", "", .team);
+    try registry.setActiveAccountKey(gpa, &reg, primary_record_key);
+    try writeActiveAuthWithIds(gpa, codex_home, "user@example.com", "team", shared_user_id, primary_account_id);
+
+    resetMockAccountNameFetcher();
+    expected_mock_account_name_fetch_account_id = primary_account_id;
+    try main_mod.maybeRefreshForegroundAccountNames(gpa, codex_home, &reg, .switch_account, mockAccountNameFetcher);
+
+    try std.testing.expectEqual(@as(usize, 1), mock_account_name_fetch_count);
+    try std.testing.expectEqualStrings("Primary Workspace", reg.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", reg.accounts.items[1].account_name.?);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[1].account_name.?);
+}
+
 test "Scenario: Given team name fetch candidates when checking grouped-account policy then only ambiguous team users qualify" {
     const gpa = std.testing.allocator;
     var reg = makeRegistry();

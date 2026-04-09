@@ -2,6 +2,10 @@
 
 This document is the single source of truth for outbound ChatGPT API refresh behavior in `codex-auth`.
 
+All API refresh requests are issued through `Node.js fetch`.
+When `codex-auth` is launched from the npm package, the wrapper passes its current Node executable to the Zig binary.
+Legacy standalone binary installs must have Node.js 18+ available on `PATH` for API-backed refresh to work.
+
 ## Endpoints
 
 ### Usage Refresh
@@ -11,7 +15,7 @@ This document is the single source of truth for outbound ChatGPT API refresh beh
 - headers:
   - `Authorization: Bearer <tokens.access_token>`
   - `ChatGPT-Account-Id: <chatgpt_account_id>`
-  - `User-Agent: codex-auth`
+  - browser-style `User-Agent` header
 
 ### Account Metadata Refresh
 
@@ -20,7 +24,7 @@ This document is the single source of truth for outbound ChatGPT API refresh beh
 - headers:
   - `Authorization: Bearer <tokens.access_token>`
   - `ChatGPT-Account-Id: <chatgpt_account_id>`
-  - `User-Agent: codex-auth`
+  - browser-style `User-Agent` header
 
 The `accounts/check` response is parsed by `chatgpt_account_id`. `name: null` and `name: ""` are both normalized to `account_name = null`.
 
@@ -41,14 +45,14 @@ The `accounts/check` response is parsed by `chatgpt_account_id`. `name: null` an
 - A usable ChatGPT auth context with both `access_token` and `chatgpt_account_id` is required. If either value is missing, refresh is skipped before any request is sent.
 - `login` refreshes immediately after the new active auth is ready.
 - Single-file `import` refreshes immediately for the imported auth context.
-- `list` schedules a detached background refresh after rendering.
-- `switch` saves the selected account first, then schedules the same detached background refresh so the command can exit immediately without waiting for `accounts/check`.
-- those `list` and `switch` background refreshes scan all registry-backed grouped scopes, not just the current `auth.json` scope.
-- the auto-switch daemon uses the same grouped-scope scan during each cycle when `auto_switch.enabled = true`.
-- `list`, `switch`, and daemon refreshes load the request auth context from stored account snapshots under `accounts/` and do not depend on the current `auth.json` belonging to the scope being refreshed.
-- when multiple stored ChatGPT snapshots exist for one grouped scope, background and daemon refreshes pick the snapshot with the newest `last_refresh`.
+- `list` refreshes synchronously before rendering and waits for `accounts/check` when the active user scope qualifies.
+- `switch` refreshes synchronously before showing the picker and waits for `accounts/check` when the current active user scope qualifies.
+- `list` and `switch` load the request auth context from the current active `auth.json`.
+- the auto-switch daemon still uses a grouped-scope scan during each cycle when `auto_switch.enabled = true`.
+- daemon refreshes load the request auth context from stored account snapshots under `accounts/` and do not depend on the current `auth.json` belonging to the scope being refreshed.
+- when multiple stored ChatGPT snapshots exist for one grouped scope, daemon refreshes pick the snapshot with the newest `last_refresh`.
 - stored snapshots without a usable `access_token` or `chatgpt_account_id` are skipped.
-- `list`, `switch`, and daemon refreshes do not backfill missing `plan` or `auth_mode` from stored snapshots before deciding whether a grouped Team scope qualifies.
+- daemon refreshes do not backfill missing `plan` or `auth_mode` from stored snapshots before deciding whether a grouped Team scope qualifies.
 
 At most one `accounts/check` request is attempted per grouped user scope in a given refresh pass.
 Request failures and unparseable responses are non-fatal and leave stored `account_name` values unchanged.
@@ -58,7 +62,8 @@ Request failures and unparseable responses are non-fatal and leave stored `accou
 Grouped account-name refresh always operates on one `chatgpt_user_id` scope at a time.
 
 - `login` and single-file `import` start from the just-parsed auth info
-- `list`, `switch`, and daemon refreshes scan registry-backed grouped scopes and refresh each qualifying scope independently
+- `list` and `switch` start from the current active auth info
+- the auto-switch daemon scans registry-backed grouped scopes and refreshes each qualifying scope independently
 
 That scope includes:
 
@@ -113,4 +118,4 @@ Then:
 - `team #1` is filled with `Prod Workspace`
 - `team #2` is overwritten from `Old Workspace` to `Sandbox Workspace`
 
-The same grouped-scope rule also applies to detached `list` / `switch` refreshes and to the auto-switch daemon. Those paths re-load the latest `registry.json` before applying each grouped `account_name` update so concurrent registry changes are preserved.
+The same grouped-scope rule also applies to synchronous `list` / pre-selection `switch` refreshes and to the auto-switch daemon.

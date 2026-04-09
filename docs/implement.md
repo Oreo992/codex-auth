@@ -167,7 +167,7 @@ When switching:
 
 The switch command refreshes the current active account's usage once before rendering account choices, so the picker does not show stale data for the currently selected account. It does not refresh the newly selected account after the switch completes.
 
-Grouped account-name metadata refresh, when needed, is scheduled after the switch has already been saved so the command can return immediately; see [docs/api-refresh.md](./api-refresh.md).
+Grouped account-name metadata refresh, when needed, now runs in the same foreground pre-selection phase as that usage refresh; see [docs/api-refresh.md](./api-refresh.md).
 
 ## Removing Accounts
 

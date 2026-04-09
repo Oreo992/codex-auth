@@ -45,6 +45,9 @@ npx @loongphy/codex-auth list
 > If you only installed `@loongphy/codex-auth` with npm, you do not need any legacy cleanup steps.
 > Older Bash/PowerShell GitHub-release installs could leave a standalone `codex-auth` binary outside npm's install path.
 > If you previously used those legacy installers, remove the leftover binaries and profile changes during migration.
+> API-backed usage refresh and team-name refresh use Node.js `fetch`.
+> npm installs already satisfy that requirement.
+> Legacy standalone binary installs need Node.js 18+ on `PATH` when `codex-auth config api enable` is used.
 
 ### Uninstall
 

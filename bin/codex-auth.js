@@ -70,7 +70,11 @@ function resolveBinary() {
 
 const binaryPath = resolveBinary();
 const child = spawnSync(binaryPath, process.argv.slice(2), {
-  stdio: "inherit"
+  stdio: "inherit",
+  env: {
+    ...process.env,
+    CODEX_AUTH_NODE_EXECUTABLE: process.execPath
+  }
 });
 
 if (child.error) {

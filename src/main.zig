@@ -196,6 +196,22 @@ fn maybeRefreshForegroundUsage(
     }
 }
 
+pub fn maybeRefreshForegroundAccountNames(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    target: ForegroundUsageRefreshTarget,
+    fetcher: AccountFetchFn,
+) !void {
+    const changed = switch (target) {
+        .list => try refreshAccountNamesForList(allocator, codex_home, reg, fetcher),
+        .switch_account => try refreshAccountNamesAfterSwitch(allocator, codex_home, reg, fetcher),
+        .remove_account => false,
+    };
+    if (!changed) return;
+    try registry.saveRegistry(allocator, codex_home, reg);
+}
+
 fn defaultAccountFetcher(
     allocator: std.mem.Allocator,
     access_token: []const u8,
@@ -481,8 +497,8 @@ fn handleList(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.Li
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     try maybeRefreshForegroundUsage(allocator, codex_home, &reg, .list);
+    try maybeRefreshForegroundAccountNames(allocator, codex_home, &reg, .list, defaultAccountFetcher);
     try format.printAccounts(&reg);
-    maybeSpawnBackgroundAccountNameRefresh(allocator, &reg);
 }
 
 fn handleLogin(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.LoginOptions) !void {
@@ -554,6 +570,7 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     try maybeRefreshForegroundUsage(allocator, codex_home, &reg, .switch_account);
+    try maybeRefreshForegroundAccountNames(allocator, codex_home, &reg, .switch_account, defaultAccountFetcher);
 
     var selected_account_key: ?[]const u8 = null;
     if (opts.query) |query| {
@@ -580,7 +597,6 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
 
     try registry.activateAccountByKey(allocator, codex_home, &reg, account_key);
     try registry.saveRegistry(allocator, codex_home, &reg);
-    maybeSpawnBackgroundAccountNameRefresh(allocator, &reg);
 }
 
 fn handleConfig(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.ConfigOptions) !void {
