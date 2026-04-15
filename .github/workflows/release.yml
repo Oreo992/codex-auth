@@ -105,7 +105,7 @@ jobs:
           fi
 
       - name: Upload artifact bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bundle-${{ matrix.id }}
           path: artifacts
@@ -121,7 +121,7 @@ jobs:
           fetch-depth: 0
 
       - name: Build release notes
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           CURRENT_TAG: ${{ github.ref_name }}
         with:
@@ -256,13 +256,13 @@ jobs:
             fs.writeFileSync("release-notes.md", lines.join("\n") + "\n");
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: release-notes.md
@@ -289,7 +289,7 @@ jobs:
           package-manager-cache: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
