@@ -278,10 +278,70 @@ fn getNonEmptyEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8
     return val;
 }
 
+fn resolveExistingCodexHomeOverride(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
+        error.IsDir => {
+            return std.fs.realpathAlloc(allocator, path) catch |realpath_err| {
+                logCodexHomeResolutionError("failed to canonicalize CODEX_HOME `{s}`: {s}", .{ path, @errorName(realpath_err) });
+                return realpath_err;
+            };
+        },
+        error.FileNotFound => {
+            logCodexHomeResolutionError("CODEX_HOME points to `{s}`, but that path does not exist", .{path});
+            return err;
+        },
+        else => {
+            logCodexHomeResolutionError("failed to read CODEX_HOME `{s}`: {s}", .{ path, @errorName(err) });
+            return err;
+        },
+    };
+    if (stat.kind != .directory) {
+        logCodexHomeResolutionError("CODEX_HOME points to `{s}`, but that path is not a directory", .{path});
+        return error.NotDir;
+    }
+    return std.fs.realpathAlloc(allocator, path) catch |err| {
+        logCodexHomeResolutionError("failed to canonicalize CODEX_HOME `{s}`: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+}
+
+fn logCodexHomeResolutionError(
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    if (builtin.is_test) return;
+    std.log.err(fmt, args);
+}
+
+pub fn resolveCodexHomeFromEnv(
+    allocator: std.mem.Allocator,
+    codex_home_override: ?[]const u8,
+    home: ?[]const u8,
+    user_profile: ?[]const u8,
+) ![]u8 {
+    if (codex_home_override) |path| {
+        if (path.len != 0) return try resolveExistingCodexHomeOverride(allocator, path);
+    }
+    if (home) |path| {
+        if (path.len != 0) return try std.fs.path.join(allocator, &[_][]const u8{ path, ".codex" });
+    }
+    if (user_profile) |path| {
+        if (path.len != 0) return try std.fs.path.join(allocator, &[_][]const u8{ path, ".codex" });
+    }
+    return error.EnvironmentVariableNotFound;
+}
+
 pub fn resolveCodexHome(allocator: std.mem.Allocator) ![]u8 {
-    const home = try resolveUserHome(allocator);
-    defer allocator.free(home);
-    return try std.fs.path.join(allocator, &[_][]const u8{ home, ".codex" });
+    const codex_home_override = try getNonEmptyEnvVarOwned(allocator, "CODEX_HOME");
+    defer if (codex_home_override) |path| allocator.free(path);
+
+    const home = try getNonEmptyEnvVarOwned(allocator, "HOME");
+    defer if (home) |path| allocator.free(path);
+
+    const user_profile = try getNonEmptyEnvVarOwned(allocator, "USERPROFILE");
+    defer if (user_profile) |path| allocator.free(path);
+
+    return try resolveCodexHomeFromEnv(allocator, codex_home_override, home, user_profile);
 }
 
 pub fn resolveUserHome(allocator: std.mem.Allocator) ![]u8 {
