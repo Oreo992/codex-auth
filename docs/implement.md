@@ -157,6 +157,7 @@ For non-interactive switching, the target account is matched case-insensitively 
 
 - alias fragment
 - email fragment
+- stored account-name fragment
 
 If multiple accounts match, interactive selection is shown. In the switch picker, `q` quits without switching.
 
@@ -166,11 +167,13 @@ When switching:
 2. The selected account’s `accounts/<account file key>.auth.json` is copied to `~/.codex/auth.json`.
 3. The registry’s `active_account_key` is updated to that account’s `record_key`.
 
-When `api.usage = true`, the switch command refreshes usage for all stored accounts before rendering account choices, using a maximum concurrency of `3`. When a per-account foreground usage request returns a non-`200` HTTP status, the picker shows that status in both usage columns for that row. When a stored account snapshot cannot make a ChatGPT usage request because the required ChatGPT auth fields are missing, the picker shows `MissingAuth` in both usage columns for that row. No extra usage refresh is attempted after the switch completes.
+When `api.usage = true`, interactive `codex-auth switch` refreshes usage for all stored accounts before rendering account choices, using a maximum concurrency of `3`. When a per-account foreground usage request returns a non-`200` HTTP status, the picker shows that status in both usage columns for that row. When a stored account snapshot cannot make a ChatGPT usage request because the required ChatGPT auth fields are missing, the picker shows `MissingAuth` in both usage columns for that row. No extra usage refresh is attempted after the switch completes.
 
-When `api.usage = false`, the switch command keeps the existing local-only behavior and can refresh only the active account from the newest local rollout data.
+When `api.usage = false`, interactive `codex-auth switch` keeps the existing local-only behavior and can refresh only the active account from the newest local rollout data.
 
-Grouped account-name metadata refresh, when needed, now runs in the same foreground pre-selection phase as that usage refresh; see [docs/api-refresh.md](./api-refresh.md).
+`codex-auth switch <query>` now stays local-only: it resolves matches from the stored registry, switches immediately on a single match, and does not wait for foreground usage or account-name API refresh before switching.
+
+Grouped account-name metadata refresh, when needed, now runs in the same foreground pre-selection phase as the interactive picker path; see [docs/api-refresh.md](./api-refresh.md).
 
 ## Removing Accounts
 

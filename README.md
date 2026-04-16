@@ -326,7 +326,7 @@ This project is provided as-is and use is at your own risk.
 **Usage Data Refresh Source:**
 `codex-auth` supports two sources for refreshing account usage/usage limit information:
 
-1. **API (default):** When `config api enable` is on, the tool makes direct HTTPS requests to OpenAI's endpoints using your account's access token. This enables both usage refresh and team name refresh.
+1. **API (default):** When `config api enable` is on, the tool makes direct HTTPS requests to OpenAI's endpoints using your account's access token. This enables both usage refresh and team name refresh. npm installs already satisfy the runtime requirement; legacy standalone binary installs need Node.js 22+ on `PATH`.
 2. **Local-only:** When `config api disable` is on, the tool scans local `~/.codex/sessions/*/rollout-*.jsonl` files for usage data and skips team name refresh API calls. This mode is safer, but it can be less accurate because recent Codex rollout files often contain `rate_limits: null`, so the latest local usage limit data may lag by several hours.
 
 **API Call Declaration:**

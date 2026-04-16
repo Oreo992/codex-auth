@@ -79,6 +79,20 @@ pub const ForegroundUsageRefreshState = struct {
     }
 };
 
+const SwitchQueryResolution = union(enum) {
+    not_found,
+    direct: []const u8,
+    multiple: std.ArrayList(usize),
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .multiple => |*matches| matches.deinit(allocator),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
 const DebugUsageLabelState = struct {
     labels: [][]const u8,
 
@@ -1224,6 +1238,30 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
     if (try registry.syncActiveAccountFromAuth(allocator, codex_home, &reg)) {
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
+    if (opts.query) |query| {
+        var resolution = try resolveSwitchQueryLocally(allocator, &reg, query);
+        defer resolution.deinit(allocator);
+
+        const selected_account_key = switch (resolution) {
+            .not_found => {
+                try cli.printAccountNotFoundError(query);
+                return error.AccountNotFound;
+            },
+            // Query-driven switching stays local-only so a direct target does not
+            // block on usage or account-name API refreshes before activation.
+            .direct => |account_key| account_key,
+            .multiple => |matches| try cli.selectAccountFromIndicesWithUsageOverrides(
+                allocator,
+                &reg,
+                matches.items,
+                null,
+            ),
+        };
+        if (selected_account_key == null) return;
+        try registry.activateAccountByKey(allocator, codex_home, &reg, selected_account_key.?);
+        try registry.saveRegistry(allocator, codex_home, &reg);
+        return;
+    }
     try ensureForegroundNodeAvailable(allocator, codex_home, &reg, .switch_account);
     var usage_state = try refreshForegroundUsageForDisplayWithApiFetcher(
         allocator,
@@ -1234,36 +1272,28 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
     defer usage_state.deinit(allocator);
     try maybeRefreshForegroundAccountNames(allocator, codex_home, &reg, .switch_account, defaultAccountFetcher);
 
-    var selected_account_key: ?[]const u8 = null;
-    if (opts.query) |query| {
-        var matches = try findMatchingAccounts(allocator, &reg, query);
-        defer matches.deinit(allocator);
+    const selected_account_key = try cli.selectAccountWithUsageOverrides(allocator, &reg, usage_state.usage_overrides);
+    if (selected_account_key == null) return;
 
-        if (matches.items.len == 0) {
-            try cli.printAccountNotFoundError(query);
-            return error.AccountNotFound;
-        }
-
-        if (matches.items.len == 1) {
-            selected_account_key = reg.accounts.items[matches.items[0]].account_key;
-        } else {
-            selected_account_key = try cli.selectAccountFromIndicesWithUsageOverrides(
-                allocator,
-                &reg,
-                matches.items,
-                usage_state.usage_overrides,
-            );
-        }
-        if (selected_account_key == null) return;
-    } else {
-        const selected = try cli.selectAccountWithUsageOverrides(allocator, &reg, usage_state.usage_overrides);
-        if (selected == null) return;
-        selected_account_key = selected.?;
-    }
-    const account_key = selected_account_key.?;
-
-    try registry.activateAccountByKey(allocator, codex_home, &reg, account_key);
+    try registry.activateAccountByKey(allocator, codex_home, &reg, selected_account_key.?);
     try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+pub fn resolveSwitchQueryLocally(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    query: []const u8,
+) !SwitchQueryResolution {
+    var matches = try findMatchingAccounts(allocator, reg, query);
+    if (matches.items.len == 0) {
+        matches.deinit(allocator);
+        return .not_found;
+    }
+    if (matches.items.len == 1) {
+        defer matches.deinit(allocator);
+        return .{ .direct = reg.accounts.items[matches.items[0]].account_key };
+    }
+    return .{ .multiple = matches };
 }
 
 fn handleConfig(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.ConfigOptions) !void {

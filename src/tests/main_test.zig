@@ -335,6 +335,44 @@ test "Scenario: Given foreground usage refresh targets when checking refresh pol
     try std.testing.expect(!main_mod.shouldRefreshForegroundUsage(.remove_account));
 }
 
+test "Scenario: Given switch query with one local match when resolving locally then it returns the target account directly" {
+    const gpa = std.testing.allocator;
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+
+    try appendAccount(gpa, &reg, primary_record_key, "active@example.com", "primary", .team);
+    try appendAccount(gpa, &reg, secondary_record_key, "backup@example.com", "secondary", .plus);
+
+    var resolution = try main_mod.resolveSwitchQueryLocally(gpa, &reg, "backup@");
+    defer resolution.deinit(gpa);
+
+    switch (resolution) {
+        .direct => |account_key| try std.testing.expectEqualStrings(secondary_record_key, account_key),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch query with multiple local matches when resolving locally then it keeps the local picker set" {
+    const gpa = std.testing.allocator;
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+
+    try appendAccount(gpa, &reg, primary_record_key, "user@example.com", "team-a", .team);
+    try appendAccount(gpa, &reg, secondary_record_key, "user@example.com", "team-b", .team);
+
+    var resolution = try main_mod.resolveSwitchQueryLocally(gpa, &reg, "team");
+    defer resolution.deinit(gpa);
+
+    switch (resolution) {
+        .multiple => |matches| {
+            try std.testing.expectEqual(@as(usize, 2), matches.items.len);
+            try std.testing.expectEqual(@as(usize, 0), matches.items[0]);
+            try std.testing.expectEqual(@as(usize, 1), matches.items[1]);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "Scenario: Given api usage refresh for list and switch when refreshing foreground usage then all accounts are updated with status overlays" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
