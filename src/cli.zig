@@ -4,11 +4,95 @@ const builtin = @import("builtin");
 const display_rows = @import("display_rows.zig");
 const registry = @import("registry.zig");
 const io_util = @import("io_util.zig");
+const terminal_color = @import("terminal_color.zig");
 const timefmt = @import("timefmt.zig");
 const version = @import("version.zig");
+const windows = std.os.windows;
 const c = @cImport({
     @cInclude("time.h");
 });
+const win = struct {
+    const BOOL = windows.BOOL;
+    const CHAR = windows.CHAR;
+    const DWORD = windows.DWORD;
+    const HANDLE = windows.HANDLE;
+    const SHORT = windows.SHORT;
+    const WCHAR = windows.WCHAR;
+    const WORD = windows.WORD;
+
+    const ENABLE_PROCESSED_INPUT: DWORD = 0x0001;
+    const ENABLE_LINE_INPUT: DWORD = 0x0002;
+    const ENABLE_ECHO_INPUT: DWORD = 0x0004;
+    const ENABLE_WINDOW_INPUT: DWORD = 0x0008;
+    const ENABLE_MOUSE_INPUT: DWORD = 0x0010;
+    const ENABLE_QUICK_EDIT_MODE: DWORD = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: DWORD = 0x0080;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
+
+    const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+    const KEY_EVENT: WORD = 0x0001;
+    const WINDOW_BUFFER_SIZE_EVENT: WORD = 0x0004;
+
+    const VK_BACK: WORD = 0x08;
+    const VK_RETURN: WORD = 0x0D;
+    const VK_ESCAPE: WORD = 0x1B;
+    const VK_UP: WORD = 0x26;
+    const VK_DOWN: WORD = 0x28;
+
+    const WAIT_OBJECT_0: DWORD = 0x00000000;
+    const WAIT_TIMEOUT: DWORD = 258;
+    const INFINITE: DWORD = 0xFFFF_FFFF;
+
+    const KEY_EVENT_RECORD = extern struct {
+        bKeyDown: BOOL,
+        wRepeatCount: WORD,
+        wVirtualKeyCode: WORD,
+        wVirtualScanCode: WORD,
+        uChar: extern union {
+            UnicodeChar: WCHAR,
+            AsciiChar: CHAR,
+        },
+        dwControlKeyState: DWORD,
+    };
+
+    const COORD = extern struct {
+        X: SHORT,
+        Y: SHORT,
+    };
+
+    const WINDOW_BUFFER_SIZE_RECORD = extern struct {
+        dwSize: COORD,
+    };
+
+    const INPUT_RECORD = extern struct {
+        EventType: WORD,
+        Event: extern union {
+            KeyEvent: KEY_EVENT_RECORD,
+            WindowBufferSizeEvent: WINDOW_BUFFER_SIZE_RECORD,
+        },
+    };
+
+    extern "kernel32" fn GetConsoleMode(
+        console_handle: HANDLE,
+        mode: *DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetConsoleMode(
+        console_handle: HANDLE,
+        mode: DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn ReadConsoleInputW(
+        console_input: HANDLE,
+        buffer: *INPUT_RECORD,
+        length: DWORD,
+        number_of_events_read: *DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn WaitForSingleObject(
+        handle: HANDLE,
+        milliseconds: DWORD,
+    ) callconv(.winapi) DWORD;
+};
 
 const ansi = struct {
     const reset = "\x1b[0m";
@@ -24,12 +108,508 @@ const ansi = struct {
     const bold = "\x1b[1m";
 };
 
+const tui_poll_input_mask: i16 = if (builtin.os.tag == .windows) 0 else std.posix.POLL.IN;
+const tui_poll_error_mask: i16 = if (builtin.os.tag == .windows) 0 else std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
+const tui_escape_sequence_timeout_ms: i32 = 100;
+
+const TuiNavigation = enum {
+    up,
+    down,
+};
+
+const TuiEscapeClassification = union(enum) {
+    incomplete,
+    ignore,
+    navigation: TuiNavigation,
+};
+
+const TuiEscapeAction = enum {
+    quit,
+    ignore,
+    move_up,
+    move_down,
+};
+
+const TuiEscapeReadResult = struct {
+    action: TuiEscapeAction,
+    buffered_bytes_consumed: usize,
+};
+
+const TuiPollResult = enum {
+    ready,
+    timeout,
+    closed,
+};
+
+const TuiInputKey = union(enum) {
+    move_up,
+    move_down,
+    enter,
+    quit,
+    backspace,
+    redraw,
+    byte: u8,
+};
+
+fn windowsTuiInputMode(saved_input_mode: win.DWORD) win.DWORD {
+    var raw_input_mode = saved_input_mode |
+        win.ENABLE_EXTENDED_FLAGS |
+        win.ENABLE_WINDOW_INPUT;
+    // Keep resize events enabled for redraws, but leave mouse explicitly disabled
+    // until the TUI has a real click/scroll interaction model.
+    raw_input_mode &= ~@as(
+        win.DWORD,
+        win.ENABLE_PROCESSED_INPUT |
+            win.ENABLE_QUICK_EDIT_MODE |
+            win.ENABLE_LINE_INPUT |
+            win.ENABLE_ECHO_INPUT |
+            win.ENABLE_MOUSE_INPUT |
+            win.ENABLE_VIRTUAL_TERMINAL_INPUT,
+    );
+    return raw_input_mode;
+}
+
+fn windowsTuiOutputMode(saved_output_mode: win.DWORD) win.DWORD {
+    return saved_output_mode |
+        win.ENABLE_PROCESSED_OUTPUT |
+        win.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+}
+
+const pollTuiInput = if (builtin.os.tag == .windows)
+    struct {
+        fn call(file: std.Io.File, timeout_ms: i32, _: i16) !TuiPollResult {
+            const wait_ms: win.DWORD = if (timeout_ms < 0) win.INFINITE else @intCast(timeout_ms);
+            return switch (win.WaitForSingleObject(file.handle, wait_ms)) {
+                win.WAIT_OBJECT_0 => .ready,
+                win.WAIT_TIMEOUT => .timeout,
+                else => .closed,
+            };
+        }
+    }.call
+else
+    struct {
+        fn call(file: std.Io.File, timeout_ms: i32, poll_error_mask: i16) !TuiPollResult {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = file.handle,
+                .events = tui_poll_input_mask,
+                .revents = 0,
+            }};
+            const ready = try std.posix.poll(&fds, timeout_ms);
+            if (ready == 0) return .timeout;
+            if ((fds[0].revents & poll_error_mask) != 0) return .closed;
+            return .ready;
+        }
+    }.call;
+
+fn writeTuiEnterTo(out: *std.Io.Writer) !void {
+    try out.writeAll("\x1b[?1049h\x1b[?25l");
+    try out.writeAll("\x1b[H\x1b[J");
+}
+
+fn writeTuiExitTo(out: *std.Io.Writer) !void {
+    try out.writeAll("\x1b[?25h\x1b[?1049l");
+}
+
+fn writeTuiResetFrameTo(out: *std.Io.Writer) !void {
+    try out.writeAll("\x1b[H\x1b[J");
+}
+
+fn switchTuiFooterText(is_windows: bool) []const u8 {
+    return if (is_windows)
+        "Keys: Up/Down or j/k, 1-9 type, Enter select, Esc or q quit\n"
+    else
+        "Keys: ↑/↓ or j/k, 1-9 type, Enter select, Esc or q quit\n";
+}
+
+fn writeSwitchTuiFooter(out: *std.Io.Writer, use_color: bool) !void {
+    if (use_color) try out.writeAll(ansi.dim);
+    try out.writeAll(switchTuiFooterText(builtin.os.tag == .windows));
+    if (use_color) try out.writeAll(ansi.reset);
+}
+
+fn removeTuiFooterText(is_windows: bool) []const u8 {
+    return if (is_windows)
+        "Keys: Up/Down or j/k move, Space toggle, 1-9 type, Enter delete, Esc or q quit\n"
+    else
+        "Keys: ↑/↓ or j/k move, Space toggle, 1-9 type, Enter delete, Esc or q quit\n";
+}
+
+fn writeRemoveTuiFooter(out: *std.Io.Writer, use_color: bool) !void {
+    if (use_color) try out.writeAll(ansi.dim);
+    try out.writeAll(removeTuiFooterText(builtin.os.tag == .windows));
+    if (use_color) try out.writeAll(ansi.reset);
+}
+
+fn writeListTuiFooter(out: *std.Io.Writer, use_color: bool) !void {
+    if (use_color) try out.writeAll(ansi.dim);
+    try out.writeAll("Keys: Esc or q quit\n");
+    if (use_color) try out.writeAll(ansi.reset);
+}
+
+fn writeTuiPromptLine(out: *std.Io.Writer, prompt: []const u8, digits: []const u8) !void {
+    try out.writeAll(prompt);
+    if (digits.len != 0) {
+        try out.writeAll(" ");
+        try out.writeAll(digits);
+    }
+    try out.writeAll("\n");
+}
+
+fn importReportMarker(outcome: registry.ImportOutcome, is_windows: bool) []const u8 {
+    return switch (outcome) {
+        .imported => if (is_windows) "[+]" else "✓",
+        .updated => if (is_windows) "[~]" else "✓",
+        .skipped => if (is_windows) "[x]" else "✗",
+    };
+}
+
+fn activeRowMarker(is_cursor_or_selected: bool, is_active: bool) []const u8 {
+    return if (is_cursor_or_selected) "> " else if (is_active) "* " else "  ";
+}
+
+const TuiSavedInputState = if (builtin.os.tag == .windows) win.DWORD else std.posix.termios;
+const TuiSavedOutputState = if (builtin.os.tag == .windows) win.DWORD else void;
+
+const TuiSession = struct {
+    input: std.Io.File,
+    output: std.Io.File,
+    saved_input_state: TuiSavedInputState = if (builtin.os.tag == .windows) 0 else undefined,
+    saved_output_state: TuiSavedOutputState = if (builtin.os.tag == .windows) 0 else {},
+    pending_windows_key: ?TuiInputKey = null,
+    pending_windows_repeat_count: u16 = 0,
+    writer_buffer: [4096]u8 = undefined,
+    writer: std.Io.File.Writer = undefined,
+
+    fn init() !@This() {
+        const input = std.Io.File.stdin();
+        const output = std.Io.File.stdout();
+        if (!(try input.isTty(app_runtime.io())) or !(try output.isTty(app_runtime.io()))) {
+            return error.TuiRequiresTty;
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            var saved_input_mode: win.DWORD = 0;
+            var saved_output_mode: win.DWORD = 0;
+            if (win.GetConsoleMode(input.handle, &saved_input_mode) == .FALSE) {
+                return error.TuiRequiresTty;
+            }
+            if (win.GetConsoleMode(output.handle, &saved_output_mode) == .FALSE) {
+                return error.TuiRequiresTty;
+            }
+
+            const raw_input_mode = windowsTuiInputMode(saved_input_mode);
+            if (win.SetConsoleMode(input.handle, raw_input_mode) == .FALSE) {
+                return error.TuiRequiresTty;
+            }
+            errdefer _ = win.SetConsoleMode(input.handle, saved_input_mode);
+
+            const raw_output_mode = windowsTuiOutputMode(saved_output_mode);
+            if (win.SetConsoleMode(output.handle, raw_output_mode) == .FALSE) {
+                return error.TuiRequiresTty;
+            }
+            errdefer _ = win.SetConsoleMode(output.handle, saved_output_mode);
+
+            var session = @This(){
+                .input = input,
+                .output = output,
+                .saved_input_state = saved_input_mode,
+                .saved_output_state = saved_output_mode,
+            };
+            session.writer = session.output.writer(app_runtime.io(), &session.writer_buffer);
+            try session.enter();
+            return session;
+        } else {
+            const saved_termios = try std.posix.tcgetattr(input.handle);
+            var raw = saved_termios;
+            raw.lflag.ICANON = false;
+            raw.lflag.ECHO = false;
+            raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
+            raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
+            try std.posix.tcsetattr(input.handle, .FLUSH, raw);
+            errdefer std.posix.tcsetattr(input.handle, .FLUSH, saved_termios) catch {};
+
+            var session = @This(){
+                .input = input,
+                .output = output,
+                .saved_input_state = saved_termios,
+            };
+            session.writer = session.output.writer(app_runtime.io(), &session.writer_buffer);
+            try session.enter();
+            return session;
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        const writer = self.out();
+        writeTuiExitTo(writer) catch {};
+        writer.flush() catch {};
+        if (comptime builtin.os.tag == .windows) {
+            _ = win.SetConsoleMode(self.output.handle, self.saved_output_state);
+            _ = win.SetConsoleMode(self.input.handle, self.saved_input_state);
+        } else {
+            std.posix.tcsetattr(self.input.handle, .FLUSH, self.saved_input_state) catch {};
+        }
+        self.* = undefined;
+    }
+
+    fn out(self: *@This()) *std.Io.Writer {
+        return &self.writer.interface;
+    }
+
+    fn read(self: *@This(), buffer: []u8) !usize {
+        return try readFileOnce(self.input, buffer);
+    }
+
+    fn readWindowsKey(self: *@This()) !TuiInputKey {
+        if (comptime builtin.os.tag != .windows) unreachable;
+
+        if (self.pending_windows_key) |pending| {
+            if (self.pending_windows_repeat_count > 1) {
+                self.pending_windows_repeat_count -= 1;
+            } else {
+                self.pending_windows_repeat_count = 0;
+                self.pending_windows_key = null;
+            }
+            return pending;
+        }
+
+        while (true) {
+            var record: win.INPUT_RECORD = undefined;
+            var events_read: win.DWORD = 0;
+            if (win.ReadConsoleInputW(self.input.handle, &record, 1, &events_read) == .FALSE) {
+                return error.EndOfStream;
+            }
+            if (events_read == 0) continue;
+            if (record.EventType == win.WINDOW_BUFFER_SIZE_EVENT) {
+                self.pending_windows_key = null;
+                self.pending_windows_repeat_count = 0;
+                return .redraw;
+            }
+            if (record.EventType != win.KEY_EVENT) continue;
+
+            const key_event = record.Event.KeyEvent;
+            if (key_event.bKeyDown == .FALSE) continue;
+
+            const key = switch (key_event.wVirtualKeyCode) {
+                win.VK_UP => TuiInputKey.move_up,
+                win.VK_DOWN => TuiInputKey.move_down,
+                win.VK_RETURN => TuiInputKey.enter,
+                win.VK_ESCAPE => TuiInputKey.quit,
+                win.VK_BACK => TuiInputKey.backspace,
+                else => blk: {
+                    const codepoint = key_event.uChar.UnicodeChar;
+                    if (codepoint == 0 or codepoint > 0x7f) continue;
+                    break :blk TuiInputKey{ .byte = @intCast(codepoint) };
+                },
+            };
+
+            const repeat_count = if (key_event.wRepeatCount == 0) 1 else key_event.wRepeatCount;
+            if (repeat_count > 1) {
+                self.pending_windows_key = key;
+                self.pending_windows_repeat_count = repeat_count - 1;
+            }
+            return key;
+        }
+    }
+
+    fn enter(self: *@This()) !void {
+        const writer = self.out();
+        try writeTuiEnterTo(writer);
+        try writer.flush();
+    }
+
+    fn resetFrame(self: *@This()) !void {
+        try writeTuiResetFrameTo(self.out());
+    }
+};
+
+fn classifyTuiEscapeSuffix(seq: []const u8) TuiEscapeClassification {
+    if (seq.len == 0) return .incomplete;
+
+    return switch (seq[0]) {
+        '[' => blk: {
+            if (seq.len == 1) break :blk .incomplete;
+            const final = seq[seq.len - 1];
+            if (final == 'A' or final == 'B') {
+                for (seq[1 .. seq.len - 1]) |ch| {
+                    if (!std.ascii.isDigit(ch) and ch != ';') break :blk .ignore;
+                }
+                break :blk .{ .navigation = if (final == 'A') .up else .down };
+            }
+            if (final >= '@' and final <= '~') break :blk .ignore;
+            break :blk .incomplete;
+        },
+        'O' => blk: {
+            if (seq.len == 1) break :blk .incomplete;
+            const code = seq[1];
+            if (code == 'A' or code == 'B') {
+                break :blk .{ .navigation = if (code == 'A') .up else .down };
+            }
+            break :blk .ignore;
+        },
+        else => .ignore,
+    };
+}
+
+fn readTuiEscapeAction(
+    tty: std.Io.File,
+    buffered_tail: []const u8,
+    poll_error_mask: i16,
+    timeout_ms: i32,
+) !TuiEscapeReadResult {
+    var seq: [8]u8 = undefined;
+    var seq_len: usize = 0;
+    var buffered_bytes_consumed: usize = 0;
+
+    while (true) {
+        switch (classifyTuiEscapeSuffix(seq[0..seq_len])) {
+            .navigation => |direction| {
+                return .{
+                    .action = switch (direction) {
+                        .up => .move_up,
+                        .down => .move_down,
+                    },
+                    .buffered_bytes_consumed = buffered_bytes_consumed,
+                };
+            },
+            .ignore => return .{
+                .action = .ignore,
+                .buffered_bytes_consumed = buffered_bytes_consumed,
+            },
+            .incomplete => {},
+        }
+
+        if (buffered_bytes_consumed < buffered_tail.len) {
+            if (seq_len == seq.len) {
+                return .{
+                    .action = .ignore,
+                    .buffered_bytes_consumed = buffered_bytes_consumed,
+                };
+            }
+            seq[seq_len] = buffered_tail[buffered_bytes_consumed];
+            seq_len += 1;
+            buffered_bytes_consumed += 1;
+            continue;
+        }
+
+        if (seq_len == seq.len) {
+            return .{
+                .action = .ignore,
+                .buffered_bytes_consumed = buffered_bytes_consumed,
+            };
+        }
+
+        switch (try pollTuiInput(tty, timeout_ms, poll_error_mask)) {
+            .timeout => return .{
+                .action = if (seq_len == 0) .quit else .ignore,
+                .buffered_bytes_consumed = buffered_bytes_consumed,
+            },
+            .closed => return .{
+                .action = .quit,
+                .buffered_bytes_consumed = buffered_bytes_consumed,
+            },
+            .ready => {},
+        }
+
+        const read_n = try readFileOnce(tty, seq[seq_len .. seq_len + 1]);
+        if (read_n == 0) {
+            return .{
+                .action = if (seq_len == 0) .quit else .ignore,
+                .buffered_bytes_consumed = buffered_bytes_consumed,
+            };
+        }
+        seq_len += read_n;
+    }
+}
+
+test "Scenario: Given tty arrow escape suffixes when classifying them then both CSI and SS3 arrows are recognized" {
+    switch (classifyTuiEscapeSuffix("[A")) {
+        .navigation => |direction| try std.testing.expectEqual(TuiNavigation.up, direction),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (classifyTuiEscapeSuffix("[1;2B")) {
+        .navigation => |direction| try std.testing.expectEqual(TuiNavigation.down, direction),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (classifyTuiEscapeSuffix("OA")) {
+        .navigation => |direction| try std.testing.expectEqual(TuiNavigation.up, direction),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Scenario: Given unrelated tty escape suffixes when classifying them then they are ignored instead of acting like quit" {
+    try std.testing.expectEqual(TuiEscapeClassification.ignore, classifyTuiEscapeSuffix("x"));
+    try std.testing.expectEqual(TuiEscapeClassification.ignore, classifyTuiEscapeSuffix("[200~"));
+    try std.testing.expectEqual(TuiEscapeClassification.incomplete, classifyTuiEscapeSuffix("["));
+}
+
+test "Scenario: Given shared TUI screen lifecycle when writing it then switch and remove can stay inside the alternate screen" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try writeTuiEnterTo(&aw.writer);
+    try writeTuiExitTo(&aw.writer);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[?1049h\x1b[?25l" ++
+            "\x1b[H\x1b[J" ++
+            "\x1b[?25h\x1b[?1049l",
+        aw.written(),
+    );
+}
+
+test "Scenario: Given shared TUI frame redraw when writing it then it clears only the alternate screen frame instead of appending full screens" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try writeTuiResetFrameTo(&aw.writer);
+
+    try std.testing.expectEqualStrings("\x1b[H\x1b[J", aw.written());
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b[2J\x1b[H") == null);
+}
+
+test "Scenario: Given TUI prompt with numeric input when rendering then the current digits stay inline with the title" {
+    const gpa = std.testing.allocator;
+    var with_digits: std.Io.Writer.Allocating = .init(gpa);
+    defer with_digits.deinit();
+    var without_digits: std.Io.Writer.Allocating = .init(gpa);
+    defer without_digits.deinit();
+
+    try writeTuiPromptLine(&with_digits.writer, "Select account to activate:", "123");
+    try std.testing.expectEqualStrings("Select account to activate: 123\n", with_digits.written());
+
+    try writeTuiPromptLine(&without_digits.writer, "Select account to activate:", "");
+    try std.testing.expectEqualStrings("Select account to activate:\n", without_digits.written());
+}
+
+test "Scenario: Given Windows TUI console modes when configuring them then resize stays enabled while mouse and cooked input stay disabled" {
+    const saved_input_mode: win.DWORD =
+        win.ENABLE_MOUSE_INPUT |
+        win.ENABLE_WINDOW_INPUT |
+        win.ENABLE_LINE_INPUT |
+        win.ENABLE_ECHO_INPUT;
+    const configured_input_mode = windowsTuiInputMode(saved_input_mode);
+
+    try std.testing.expect((configured_input_mode & win.ENABLE_WINDOW_INPUT) != 0);
+    try std.testing.expect((configured_input_mode & win.ENABLE_EXTENDED_FLAGS) != 0);
+    try std.testing.expect((configured_input_mode & win.ENABLE_MOUSE_INPUT) == 0);
+    try std.testing.expect((configured_input_mode & win.ENABLE_LINE_INPUT) == 0);
+    try std.testing.expect((configured_input_mode & win.ENABLE_ECHO_INPUT) == 0);
+    try std.testing.expect((configured_input_mode & win.ENABLE_VIRTUAL_TERMINAL_INPUT) == 0);
+
+    const configured_output_mode = windowsTuiOutputMode(0);
+    try std.testing.expect((configured_output_mode & win.ENABLE_PROCESSED_OUTPUT) != 0);
+    try std.testing.expect((configured_output_mode & win.ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0);
+}
+
 fn colorEnabled() bool {
-    return std.Io.File.stdout().isTty(app_runtime.io()) catch false;
+    return terminal_color.stdoutColorEnabled();
 }
 
 fn stderrColorEnabled() bool {
-    return std.Io.File.stderr().isTty(app_runtime.io()) catch false;
+    return terminal_color.stderrColorEnabled();
 }
 
 fn readFileOnce(file: std.Io.File, buffer: []u8) !usize {
@@ -47,7 +627,7 @@ pub const ApiMode = enum {
 };
 
 pub const ListOptions = struct {
-    debug: bool = false,
+    live: bool = false,
     api_mode: ApiMode = .default,
 };
 pub const LoginOptions = struct {
@@ -62,11 +642,14 @@ pub const ImportOptions = struct {
 };
 pub const SwitchOptions = struct {
     query: ?[]u8,
+    live: bool = false,
+    auto: bool = false,
     api_mode: ApiMode = .default,
 };
 pub const RemoveOptions = struct {
     selectors: [][]const u8,
     all: bool,
+    live: bool = false,
     api_mode: ApiMode = .default,
 };
 pub const CleanOptions = struct {};
@@ -160,11 +743,11 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
-            if (std.mem.eql(u8, arg, "--debug")) {
-                if (opts.debug) {
-                    return usageErrorResult(allocator, .list, "duplicate `--debug` for `list`.", .{});
+            if (std.mem.eql(u8, arg, "--live")) {
+                if (opts.live) {
+                    return usageErrorResult(allocator, .list, "duplicate `--live` for `list`.", .{});
                 }
-                opts.debug = true;
+                opts.live = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--api")) {
@@ -295,6 +878,22 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
+            if (std.mem.eql(u8, arg, "--live")) {
+                if (opts.live) {
+                    if (opts.query) |query| allocator.free(query);
+                    return usageErrorResult(allocator, .switch_account, "duplicate `--live` for `switch`.", .{});
+                }
+                opts.live = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--auto")) {
+                if (opts.auto) {
+                    if (opts.query) |query| allocator.free(query);
+                    return usageErrorResult(allocator, .switch_account, "duplicate `--auto` for `switch`.", .{});
+                }
+                opts.auto = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--api")) {
                 switch (opts.api_mode) {
                     .default => opts.api_mode = .force_api,
@@ -333,12 +932,16 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
             }
             opts.query = try allocator.dupe(u8, arg);
         }
-        if (opts.query != null and opts.api_mode != .default) {
+        if (opts.auto and !opts.live) {
+            if (opts.query) |query| allocator.free(query);
+            return usageErrorResult(allocator, .switch_account, "`--auto` requires `--live` for `switch`.", .{});
+        }
+        if (opts.query != null and (opts.api_mode != .default or opts.live or opts.auto)) {
             if (opts.query) |query| allocator.free(query);
             return usageErrorResult(
                 allocator,
                 .switch_account,
-                "`switch <query>` does not support `--api` or `--skip-api`.",
+                "`switch <query>` does not support `--live`, `--auto`, `--api`, or `--skip-api`.",
                 .{},
             );
         }
@@ -353,64 +956,62 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         var selectors = std.ArrayList([]const u8).empty;
         errdefer freeOwnedStringList(allocator, selectors.items);
         defer selectors.deinit(allocator);
-        var all = false;
-        var api_mode: ApiMode = .default;
+        var opts: RemoveOptions = .{
+            .selectors = &.{},
+            .all = false,
+        };
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
+            if (std.mem.eql(u8, arg, "--live")) {
+                if (opts.live) {
+                    return usageErrorResult(allocator, .remove_account, "duplicate `--live` for `remove`.", .{});
+                }
+                opts.live = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--api")) {
-                switch (api_mode) {
-                    .default => api_mode = .force_api,
-                    .force_api => {
-                        return usageErrorResult(allocator, .remove_account, "duplicate `--api` for `remove`.", .{});
-                    },
-                    .skip_api => {
-                        return usageErrorResult(allocator, .remove_account, "`--api` cannot be combined with `--skip-api` for `remove`.", .{});
-                    },
+                switch (opts.api_mode) {
+                    .default => opts.api_mode = .force_api,
+                    .force_api => return usageErrorResult(allocator, .remove_account, "duplicate `--api` for `remove`.", .{}),
+                    .skip_api => return usageErrorResult(allocator, .remove_account, "`--api` cannot be combined with `--skip-api` for `remove`.", .{}),
                 }
                 continue;
             }
             if (std.mem.eql(u8, arg, "--skip-api")) {
-                switch (api_mode) {
-                    .default => api_mode = .skip_api,
-                    .skip_api => {
-                        return usageErrorResult(allocator, .remove_account, "duplicate `--skip-api` for `remove`.", .{});
-                    },
-                    .force_api => {
-                        return usageErrorResult(allocator, .remove_account, "`--skip-api` cannot be combined with `--api` for `remove`.", .{});
-                    },
+                switch (opts.api_mode) {
+                    .default => opts.api_mode = .skip_api,
+                    .skip_api => return usageErrorResult(allocator, .remove_account, "duplicate `--skip-api` for `remove`.", .{}),
+                    .force_api => return usageErrorResult(allocator, .remove_account, "`--skip-api` cannot be combined with `--api` for `remove`.", .{}),
                 }
                 continue;
             }
             if (std.mem.eql(u8, arg, "--all")) {
-                if (all or selectors.items.len != 0) {
+                if (opts.all or selectors.items.len != 0) {
                     return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--all` with another selector.", .{});
                 }
-                all = true;
+                opts.all = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, "-")) {
                 return usageErrorResult(allocator, .remove_account, "unknown flag `{s}` for `remove`.", .{arg});
             }
-            if (all) {
+            if (opts.all) {
                 return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--all` with another selector.", .{});
             }
             try selectors.append(allocator, try allocator.dupe(u8, arg));
         }
-        if (api_mode != .default and (all or selectors.items.len != 0)) {
+        if ((opts.live or opts.api_mode != .default) and (opts.all or selectors.items.len != 0)) {
             freeOwnedStringList(allocator, selectors.items);
             return usageErrorResult(
                 allocator,
                 .remove_account,
-                "`remove <query>` and `remove --all` do not support `--api` or `--skip-api`.",
+                "`remove <query>` and `remove --all` do not support `--live`, `--api`, or `--skip-api`.",
                 .{},
             );
         }
-        return .{ .command = .{ .remove_account = .{
-            .selectors = try selectors.toOwnedSlice(allocator),
-            .all = all,
-            .api_mode = api_mode,
-        } } };
+        opts.selectors = try selectors.toOwnedSlice(allocator);
+        return .{ .command = .{ .remove_account = opts } };
     }
 
     if (std.mem.eql(u8, cmd, "clean")) {
@@ -657,8 +1258,8 @@ pub fn writeHelp(
         .{ .name = "status", .description = "Show auto-switch and usage API status" },
         .{ .name = "login", .description = "Login and add the current account" },
         .{ .name = "import", .description = "Import auth files or rebuild registry" },
-        .{ .name = "switch [--api|--skip-api] | switch <query>", .description = "Switch the active account" },
-        .{ .name = "remove [<query>...] | remove --all", .description = "Remove one or more accounts" },
+        .{ .name = "switch [--live] [--auto] [--api|--skip-api] | switch <query>", .description = "Switch the active account" },
+        .{ .name = "remove [--live] [--api|--skip-api] | remove <query> [<query>...] | remove --all", .description = "Remove one or more accounts" },
         .{ .name = "clean", .description = "Delete backup and stale files under accounts/" },
         .{ .name = "config", .description = "Manage configuration" },
     };
@@ -805,7 +1406,7 @@ fn commandDescriptionForTopic(topic: HelpTopic) []const u8 {
         .login => "Run `codex login` or `codex login --device-auth`, then add the current account.",
         .import_auth => "Import auth files or rebuild the registry.",
         .switch_account => "Switch the active account interactively, or by query using stored local data.",
-        .remove_account => "Remove one or more accounts by query or list row number using stored local data.",
+        .remove_account => "Remove one or more accounts interactively or by query.",
         .clean => "Delete backup and stale files under accounts/.",
         .config => "Manage auto-switch and usage API configuration.",
         .daemon => "Run the background auto-switch daemon.",
@@ -827,7 +1428,7 @@ fn writeUsageSection(out: *std.Io.Writer, topic: HelpTopic) !void {
             try out.writeAll("  codex-auth --help\n");
             try out.writeAll("  codex-auth help <command>\n");
         },
-        .list => try out.writeAll("  codex-auth list [--debug] [--api|--skip-api]\n"),
+        .list => try out.writeAll("  codex-auth list [--live] [--api|--skip-api]\n"),
         .status => try out.writeAll("  codex-auth status\n"),
         .login => {
             try out.writeAll("  codex-auth login\n");
@@ -839,11 +1440,11 @@ fn writeUsageSection(out: *std.Io.Writer, topic: HelpTopic) !void {
             try out.writeAll("  codex-auth import --purge [<path>]\n");
         },
         .switch_account => {
-            try out.writeAll("  codex-auth switch [--api|--skip-api]\n");
+            try out.writeAll("  codex-auth switch [--live] [--auto] [--api|--skip-api]\n");
             try out.writeAll("  codex-auth switch <query>\n");
         },
         .remove_account => {
-            try out.writeAll("  codex-auth remove [--api|--skip-api]\n");
+            try out.writeAll("  codex-auth remove [--live] [--api|--skip-api]\n");
             try out.writeAll("  codex-auth remove <query> [<query>...]\n");
             try out.writeAll("  codex-auth remove --all\n");
         },
@@ -873,7 +1474,7 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         },
         .list => {
             try out.writeAll("  codex-auth list\n");
-            try out.writeAll("  codex-auth list --debug\n");
+            try out.writeAll("  codex-auth list --live\n");
             try out.writeAll("  codex-auth list --api\n");
             try out.writeAll("  codex-auth list --skip-api\n");
         },
@@ -889,6 +1490,8 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         },
         .switch_account => {
             try out.writeAll("  codex-auth switch\n");
+            try out.writeAll("  codex-auth switch --live\n");
+            try out.writeAll("  codex-auth switch --live --auto\n");
             try out.writeAll("  codex-auth switch --api\n");
             try out.writeAll("  codex-auth switch --skip-api\n");
             try out.writeAll("  codex-auth switch work\n");
@@ -896,6 +1499,7 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         },
         .remove_account => {
             try out.writeAll("  codex-auth remove\n");
+            try out.writeAll("  codex-auth remove --live\n");
             try out.writeAll("  codex-auth remove --api\n");
             try out.writeAll("  codex-auth remove --skip-api\n");
             try out.writeAll("  codex-auth remove 01 03\n");
@@ -965,6 +1569,7 @@ pub fn writeImportReport(
     err_out: *std.Io.Writer,
     report: *const registry.ImportReport,
 ) !void {
+    const is_windows = builtin.os.tag == .windows;
     if (report.render_kind == .scanned) {
         try out.print("Scanning {s}...\n", .{report.source_label.?});
         try out.flush();
@@ -973,15 +1578,15 @@ pub fn writeImportReport(
     for (report.events.items) |event| {
         switch (event.outcome) {
             .imported => {
-                try out.print("  ✓ imported  {s}\n", .{event.label});
+                try out.print("  {s} imported  {s}\n", .{ importReportMarker(.imported, is_windows), event.label });
                 try out.flush();
             },
             .updated => {
-                try out.print("  ✓ updated   {s}\n", .{event.label});
+                try out.print("  {s} updated   {s}\n", .{ importReportMarker(.updated, is_windows), event.label });
                 try out.flush();
             },
             .skipped => {
-                try err_out.print("  ✗ skipped   {s}: {s}\n", .{ event.label, event.reason.? });
+                try err_out.print("  {s} skipped   {s}: {s}\n", .{ importReportMarker(.skipped, is_windows), event.label, event.reason.? });
                 try err_out.flush();
             },
         }
@@ -1050,6 +1655,30 @@ pub fn printAccountNotFoundErrors(queries: []const []const u8) !void {
         try out.writeAll(query);
     }
     try out.writeAll(".\n");
+    try out.flush();
+}
+
+pub fn printSwitchRequiresTtyError() !void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
+    const out = &writer.interface;
+    const use_color = stderrColorEnabled();
+    try writeErrorPrefixTo(out, use_color);
+    try out.writeAll(" interactive switch requires a TTY.\n");
+    try writeHintPrefixTo(out, use_color);
+    try out.writeAll(" Run `codex-auth switch` in a terminal, or narrow `codex-auth switch <query>` to one account.\n");
+    try out.flush();
+}
+
+pub fn printListRequiresTtyError() !void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
+    const out = &writer.interface;
+    const use_color = stderrColorEnabled();
+    try writeErrorPrefixTo(out, use_color);
+    try out.writeAll(" live list requires a TTY.\n");
+    try writeHintPrefixTo(out, use_color);
+    try out.writeAll(" Run `codex-auth list --live` in a terminal.\n");
     try out.flush();
 }
 
@@ -1170,6 +1799,27 @@ pub fn printRemoveSummary(labels: []const []const u8) !void {
     try out.flush();
 }
 
+pub fn printSwitchedAccount(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    account_key: []const u8,
+) !void {
+    const label = if (registry.findAccountIndexByAccountKey(reg, account_key)) |idx|
+        try display_rows.buildPreferredAccountLabelAlloc(allocator, &reg.accounts.items[idx], reg.accounts.items[idx].email)
+    else
+        try allocator.dupe(u8, account_key);
+    defer allocator.free(label);
+
+    var stdout: io_util.Stdout = undefined;
+    stdout.init();
+    const out = stdout.out();
+    const use_color = colorEnabled();
+    if (use_color) try out.writeAll(ansi.bold_green);
+    try out.print("Switched to {s}\n", .{label});
+    if (use_color) try out.writeAll(ansi.reset);
+    try out.flush();
+}
+
 fn writeCodexLoginLaunchFailureHint(err_name: []const u8, use_color: bool) !void {
     var buffer: [512]u8 = undefined;
     var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
@@ -1235,10 +1885,1006 @@ pub fn selectAccountWithUsageOverrides(
     reg: *registry.Registry,
     usage_overrides: ?[]const ?[]const u8,
 ) !?[]const u8 {
-    return if (comptime builtin.os.tag == .windows)
-        selectWithNumbers(allocator, reg, usage_overrides)
+    if (shouldUseNumberedSwitchSelector(
+        comptime builtin.os.tag == .windows,
+        std.Io.File.stdin().isTty(app_runtime.io()) catch false,
+        std.Io.File.stdout().isTty(app_runtime.io()) catch false,
+    )) {
+        return selectWithNumbers(allocator, reg, usage_overrides);
+    }
+    return selectInteractive(allocator, reg, usage_overrides) catch |err| switch (err) {
+        error.TuiRequiresTty => selectWithNumbers(allocator, reg, usage_overrides),
+        else => return err,
+    };
+}
+
+pub const SwitchSelectionDisplay = struct {
+    reg: *registry.Registry,
+    usage_overrides: ?[]const ?[]const u8,
+};
+
+pub const OwnedSwitchSelectionDisplay = struct {
+    reg: registry.Registry,
+    usage_overrides: []?[]const u8,
+
+    pub fn borrowed(self: *@This()) SwitchSelectionDisplay {
+        return .{
+            .reg = &self.reg,
+            .usage_overrides = self.usage_overrides,
+        };
+    }
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.usage_overrides) |usage_override| {
+            if (usage_override) |value| allocator.free(value);
+        }
+        allocator.free(self.usage_overrides);
+        self.reg.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const SwitchLiveController = struct {
+    context: *anyopaque,
+    maybe_start_refresh: *const fn (context: *anyopaque) anyerror!void,
+    maybe_take_updated_display: *const fn (context: *anyopaque) anyerror!?OwnedSwitchSelectionDisplay,
+    build_status_line: *const fn (
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        display: SwitchSelectionDisplay,
+    ) anyerror![]u8,
+};
+
+pub const LiveActionOutcome = struct {
+    updated_display: OwnedSwitchSelectionDisplay,
+    action_message: ?[]u8 = null,
+};
+
+pub const SwitchLiveActionController = struct {
+    refresh: SwitchLiveController,
+    apply_selection: *const fn (
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        display: SwitchSelectionDisplay,
+        account_key: []const u8,
+    ) anyerror!LiveActionOutcome,
+    auto_switch: bool = false,
+};
+
+pub const RemoveLiveActionController = struct {
+    refresh: SwitchLiveController,
+    apply_selection: *const fn (
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        display: SwitchSelectionDisplay,
+        account_keys: []const []const u8,
+    ) anyerror!LiveActionOutcome,
+};
+
+pub fn selectAccountWithLiveUpdates(
+    allocator: std.mem.Allocator,
+    initial_display: OwnedSwitchSelectionDisplay,
+    controller: SwitchLiveController,
+) !?[]const u8 {
+    var current_display = initial_display;
+    defer current_display.deinit(allocator);
+    if (current_display.reg.accounts.items.len == 0) return null;
+
+    if (shouldUseNumberedSwitchSelector(
+        comptime builtin.os.tag == .windows,
+        std.Io.File.stdin().isTty(app_runtime.io()) catch false,
+        std.Io.File.stdout().isTty(app_runtime.io()) catch false,
+    )) {
+        const selected_account_key = try selectWithNumbers(allocator, &current_display.reg, current_display.usage_overrides);
+        return try dupeOptionalAccountKey(allocator, selected_account_key);
+    }
+
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+
+    const out = tui.out();
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const ui_tick_ms: i32 = 1000;
+
+    var selected_account_key = if (current_display.reg.active_account_key) |key|
+        try allocator.dupe(u8, key)
     else
-        selectInteractive(allocator, reg, usage_overrides) catch selectWithNumbers(allocator, reg, usage_overrides);
+        null;
+    defer if (selected_account_key) |key| allocator.free(key);
+
+    var number_buf: [8]u8 = undefined;
+    var number_len: usize = 0;
+
+    while (true) {
+        if (try controller.maybe_take_updated_display(controller.context)) |updated| {
+            current_display.deinit(allocator);
+            current_display = updated;
+        }
+
+        const borrowed = current_display.borrowed();
+        var rows = try buildSwitchRowsWithUsageOverrides(allocator, borrowed.reg, borrowed.usage_overrides);
+        defer rows.deinit(allocator);
+        try filterErroredRowsFromSelectableIndices(allocator, &rows);
+        const total_accounts = accountRowCount(rows.items);
+        if (total_accounts == 0) return null;
+
+        var selected_idx: ?usize = null;
+        if (rows.selectable_row_indices.len != 0) {
+            selected_idx = if (selected_account_key) |key|
+                selectableIndexForAccountKey(&rows, borrowed.reg, key) orelse activeSelectableIndex(&rows) orelse 0
+            else
+                activeSelectableIndex(&rows) orelse 0;
+            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selected_idx.?);
+        }
+
+        const status_line = try controller.build_status_line(controller.context, allocator, borrowed);
+        defer allocator.free(status_line);
+        const selected_display_idx = selectedDisplayIndexForRender(&rows, selected_idx, number_buf[0..number_len]);
+
+        try tui.resetFrame();
+        try renderSwitchScreen(
+            out,
+            borrowed.reg,
+            rows.items,
+            @max(@as(usize, 2), indexWidth(total_accounts)),
+            rows.widths,
+            selected_display_idx,
+            use_color,
+            status_line,
+            "",
+            number_buf[0..number_len],
+        );
+        try out.flush();
+
+        switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
+            .timeout => {
+                try controller.maybe_start_refresh(controller.context);
+                continue;
+            },
+            .closed => return null,
+            .ready => {},
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (selected_idx) |idx| {
+                        if (idx > 0) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .move_down => {
+                    if (selected_idx) |idx| {
+                        if (idx + 1 < rows.selectable_row_indices.len) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .enter => {
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        return try dupSelectedAccountKeyForDisplayedAccount(allocator, &rows, borrowed.reg, displayed_idx);
+                    }
+                    if (selected_idx) |idx| {
+                        return try dupSelectedAccountKey(allocator, &rows, borrowed.reg, idx);
+                    }
+                    return null;
+                },
+                .quit => return null,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return null;
+
+                    if (ch == 'k') {
+                        if (selected_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch == 'j') {
+                        if (selected_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                            }
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        if (n == 0) return null;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (selected_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .move_down => {
+                        if (selected_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .quit => return null,
+                    .ignore => {},
+                }
+                i += escape.buffered_bytes_consumed;
+                continue;
+            }
+
+            if (b[i] == '\r' or b[i] == '\n') {
+                if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                    return try dupSelectedAccountKeyForDisplayedAccount(allocator, &rows, borrowed.reg, displayed_idx);
+                }
+                if (selected_idx) |idx| {
+                    return try dupSelectedAccountKey(allocator, &rows, borrowed.reg, idx);
+                }
+                return null;
+            }
+            if (isQuitKey(b[i])) return null;
+
+            if (b[i] == 'k') {
+                if (selected_idx) |idx| {
+                    if (idx > 0) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == 'j') {
+                if (selected_idx) |idx| {
+                    if (idx + 1 < rows.selectable_row_indices.len) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == 0x7f or b[i] == 0x08) {
+                if (number_len > 0) {
+                    number_len -= 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (b[i] >= '0' and b[i] <= '9') {
+                if (number_len < number_buf.len) {
+                    number_buf[number_len] = b[i];
+                    number_len += 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+    }
+}
+
+pub fn viewAccountsWithLiveUpdates(
+    allocator: std.mem.Allocator,
+    initial_display: OwnedSwitchSelectionDisplay,
+    controller: SwitchLiveController,
+) !void {
+    var current_display = initial_display;
+    defer current_display.deinit(allocator);
+
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+
+    const out = tui.out();
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const ui_tick_ms: i32 = 1000;
+
+    while (true) {
+        if (try controller.maybe_take_updated_display(controller.context)) |updated| {
+            current_display.deinit(allocator);
+            current_display = updated;
+        }
+
+        var rows = try buildSwitchRowsWithUsageOverrides(allocator, &current_display.reg, current_display.usage_overrides);
+        defer rows.deinit(allocator);
+        const status_line = try controller.build_status_line(controller.context, allocator, current_display.borrowed());
+        defer allocator.free(status_line);
+
+        try tui.resetFrame();
+        try renderListScreen(
+            out,
+            &current_display.reg,
+            rows.items,
+            @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len)),
+            rows.widths,
+            use_color,
+            status_line,
+        );
+        try out.flush();
+
+        switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
+            .timeout => {
+                try controller.maybe_start_refresh(controller.context);
+                continue;
+            },
+            .closed => return,
+            .ready => {},
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .quit => return,
+                .redraw => continue,
+                else => continue,
+            }
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        if (n == 0) return;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .quit => return,
+                    else => {},
+                }
+                i += escape.buffered_bytes_consumed;
+                continue;
+            }
+            if (isQuitKey(b[i])) return;
+        }
+    }
+}
+
+pub fn runSwitchLiveActions(
+    allocator: std.mem.Allocator,
+    initial_display: OwnedSwitchSelectionDisplay,
+    controller: SwitchLiveActionController,
+) !void {
+    var current_display = initial_display;
+    defer current_display.deinit(allocator);
+
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+
+    const out = tui.out();
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const ui_tick_ms: i32 = 1000;
+
+    var selected_account_key = if (current_display.reg.active_account_key) |key|
+        try allocator.dupe(u8, key)
+    else
+        null;
+    defer if (selected_account_key) |key| allocator.free(key);
+
+    var action_message: ?[]u8 = null;
+    defer if (action_message) |message| allocator.free(message);
+
+    var number_buf: [8]u8 = undefined;
+    var number_len: usize = 0;
+    var auto_check_pending = controller.auto_switch;
+
+    while (true) {
+        if (try controller.refresh.maybe_take_updated_display(controller.refresh.context)) |updated| {
+            current_display.deinit(allocator);
+            current_display = updated;
+            auto_check_pending = controller.auto_switch;
+        }
+
+        const borrowed = current_display.borrowed();
+        var rows = try buildSwitchRowsWithUsageOverrides(allocator, borrowed.reg, borrowed.usage_overrides);
+        defer rows.deinit(allocator);
+        try filterErroredRowsFromSelectableIndices(allocator, &rows);
+        const total_accounts = accountRowCount(rows.items);
+
+        var selected_idx: ?usize = null;
+        if (rows.selectable_row_indices.len != 0) {
+            selected_idx = if (selected_account_key) |key|
+                selectableIndexForAccountKey(&rows, borrowed.reg, key) orelse activeSelectableIndex(&rows) orelse 0
+            else
+                activeSelectableIndex(&rows) orelse 0;
+            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selected_idx.?);
+        }
+
+        if (auto_check_pending) {
+            if (try maybeAutoSwitchTargetKeyAlloc(allocator, borrowed, &rows)) |target_key| {
+                defer allocator.free(target_key);
+                const outcome = controller.apply_selection(controller.refresh.context, allocator, borrowed, target_key) catch |err| {
+                    replaceOptionalOwnedString(
+                        allocator,
+                        &action_message,
+                        try std.fmt.allocPrint(allocator, "Auto-switch failed: {s}", .{@errorName(err)}),
+                    );
+                    replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                    number_len = 0;
+                    auto_check_pending = false;
+                    continue;
+                };
+                current_display.deinit(allocator);
+                current_display = outcome.updated_display;
+                replaceOptionalOwnedString(allocator, &action_message, outcome.action_message);
+                replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                number_len = 0;
+                auto_check_pending = controller.auto_switch;
+                continue;
+            }
+            auto_check_pending = false;
+        }
+
+        const status_line = try controller.refresh.build_status_line(controller.refresh.context, allocator, borrowed);
+        defer allocator.free(status_line);
+        const selected_display_idx = selectedDisplayIndexForRender(&rows, selected_idx, number_buf[0..number_len]);
+
+        try tui.resetFrame();
+        try renderSwitchScreen(
+            out,
+            borrowed.reg,
+            rows.items,
+            @max(@as(usize, 2), indexWidth(total_accounts)),
+            rows.widths,
+            selected_display_idx,
+            use_color,
+            status_line,
+            action_message orelse "",
+            number_buf[0..number_len],
+        );
+        try out.flush();
+
+        switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
+            .timeout => {
+                try controller.refresh.maybe_start_refresh(controller.refresh.context);
+                continue;
+            },
+            .closed => return,
+            .ready => {},
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (selected_idx) |idx| {
+                        if (idx > 0) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .move_down => {
+                    if (selected_idx) |idx| {
+                        if (idx + 1 < rows.selectable_row_indices.len) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .enter => {
+                    const target_key = if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx|
+                        try allocator.dupe(u8, accountIdForDisplayedAccount(&rows, borrowed.reg, displayed_idx) orelse continue)
+                    else if (selected_idx) |idx|
+                        try accountKeyForSelectableAlloc(allocator, &rows, borrowed.reg, idx)
+                    else
+                        continue;
+                    defer allocator.free(target_key);
+                    const outcome = controller.apply_selection(controller.refresh.context, allocator, borrowed, target_key) catch |err| {
+                        replaceOptionalOwnedString(
+                            allocator,
+                            &action_message,
+                            try std.fmt.allocPrint(allocator, "Switch failed: {s}", .{@errorName(err)}),
+                        );
+                        replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                        number_len = 0;
+                        continue;
+                    };
+                    current_display.deinit(allocator);
+                    current_display = outcome.updated_display;
+                    replaceOptionalOwnedString(allocator, &action_message, outcome.action_message);
+                    replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                    number_len = 0;
+                    auto_check_pending = controller.auto_switch;
+                },
+                .quit => return,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return;
+                    if (ch == 'k') {
+                        if (selected_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch == 'j') {
+                        if (selected_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                            }
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        if (n == 0) return;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (selected_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .move_down => {
+                        if (selected_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .quit => return,
+                    .ignore => {},
+                }
+                i += escape.buffered_bytes_consumed;
+                continue;
+            }
+
+            if (b[i] == '\r' or b[i] == '\n') {
+                const target_key = if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx|
+                    try allocator.dupe(u8, accountIdForDisplayedAccount(&rows, borrowed.reg, displayed_idx) orelse continue)
+                else if (selected_idx) |idx|
+                    try accountKeyForSelectableAlloc(allocator, &rows, borrowed.reg, idx)
+                else
+                    continue;
+                defer allocator.free(target_key);
+                const outcome = controller.apply_selection(controller.refresh.context, allocator, borrowed, target_key) catch |err| {
+                    replaceOptionalOwnedString(
+                        allocator,
+                        &action_message,
+                        try std.fmt.allocPrint(allocator, "Switch failed: {s}", .{@errorName(err)}),
+                    );
+                    replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                    number_len = 0;
+                    continue;
+                };
+                current_display.deinit(allocator);
+                current_display = outcome.updated_display;
+                replaceOptionalOwnedString(allocator, &action_message, outcome.action_message);
+                replaceOptionalOwnedString(allocator, &selected_account_key, try allocator.dupe(u8, target_key));
+                number_len = 0;
+                auto_check_pending = controller.auto_switch;
+                continue;
+            }
+            if (isQuitKey(b[i])) return;
+
+            if (b[i] == 'k') {
+                if (selected_idx) |idx| {
+                    if (idx > 0) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx - 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == 'j') {
+                if (selected_idx) |idx| {
+                    if (idx + 1 < rows.selectable_row_indices.len) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, idx + 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == 0x7f or b[i] == 0x08) {
+                if (number_len > 0) {
+                    number_len -= 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (b[i] >= '0' and b[i] <= '9') {
+                if (number_len < number_buf.len) {
+                    number_buf[number_len] = b[i];
+                    number_len += 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &selected_account_key, &rows, borrowed.reg, selectable_idx);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+    }
+}
+
+pub fn runRemoveLiveActions(
+    allocator: std.mem.Allocator,
+    initial_display: OwnedSwitchSelectionDisplay,
+    controller: RemoveLiveActionController,
+) !void {
+    var current_display = initial_display;
+    defer current_display.deinit(allocator);
+
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+
+    const out = tui.out();
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const ui_tick_ms: i32 = 1000;
+
+    var cursor_account_key: ?[]u8 = null;
+    defer if (cursor_account_key) |key| allocator.free(key);
+
+    var checked_account_keys = std.ArrayList([]u8).empty;
+    defer {
+        clearOwnedAccountKeys(allocator, &checked_account_keys);
+        checked_account_keys.deinit(allocator);
+    }
+
+    var action_message: ?[]u8 = null;
+    defer if (action_message) |message| allocator.free(message);
+
+    var number_buf: [8]u8 = undefined;
+    var number_len: usize = 0;
+
+    while (true) {
+        if (try controller.refresh.maybe_take_updated_display(controller.refresh.context)) |updated| {
+            current_display.deinit(allocator);
+            current_display = updated;
+        }
+
+        const borrowed = current_display.borrowed();
+        var rows = try buildSwitchRowsWithUsageOverrides(allocator, borrowed.reg, borrowed.usage_overrides);
+        defer rows.deinit(allocator);
+
+        var cursor_idx: ?usize = null;
+        if (rows.selectable_row_indices.len != 0) {
+            cursor_idx = if (cursor_account_key) |key|
+                selectableIndexForAccountKey(&rows, borrowed.reg, key) orelse activeSelectableIndex(&rows) orelse 0
+            else
+                activeSelectableIndex(&rows) orelse 0;
+            try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, cursor_idx.?);
+        }
+
+        const checked_flags = try allocator.alloc(bool, rows.selectable_row_indices.len);
+        defer allocator.free(checked_flags);
+        for (checked_flags, 0..) |*flag, selectable_idx| {
+            flag.* = containsOwnedAccountKey(&checked_account_keys, accountIdForSelectable(&rows, borrowed.reg, selectable_idx));
+        }
+
+        const status_line = try controller.refresh.build_status_line(controller.refresh.context, allocator, borrowed);
+        defer allocator.free(status_line);
+
+        try tui.resetFrame();
+        try renderRemoveScreen(
+            out,
+            borrowed.reg,
+            rows.items,
+            @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len)),
+            rows.widths,
+            cursor_idx,
+            checked_flags,
+            use_color,
+            status_line,
+            action_message orelse "",
+            number_buf[0..number_len],
+        );
+        try out.flush();
+
+        switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
+            .timeout => {
+                try controller.refresh.maybe_start_refresh(controller.refresh.context);
+                continue;
+            },
+            .closed => return,
+            .ready => {},
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (cursor_idx) |idx| {
+                        if (idx > 0) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx - 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .move_down => {
+                    if (cursor_idx) |idx| {
+                        if (idx + 1 < rows.selectable_row_indices.len) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx + 1);
+                            number_len = 0;
+                        }
+                    }
+                },
+                .enter => {
+                    if (checked_account_keys.items.len == 0) {
+                        replaceOptionalOwnedString(allocator, &action_message, try allocator.dupe(u8, "No accounts selected"));
+                        continue;
+                    }
+                    const selected_keys = try allocator.alloc([]const u8, checked_account_keys.items.len);
+                    defer allocator.free(selected_keys);
+                    for (checked_account_keys.items, 0..) |key, idx| selected_keys[idx] = key;
+                    const outcome = controller.apply_selection(controller.refresh.context, allocator, borrowed, selected_keys) catch |err| {
+                        replaceOptionalOwnedString(
+                            allocator,
+                            &action_message,
+                            try std.fmt.allocPrint(allocator, "Delete failed: {s}", .{@errorName(err)}),
+                        );
+                        continue;
+                    };
+                    clearOwnedAccountKeys(allocator, &checked_account_keys);
+                    current_display.deinit(allocator);
+                    current_display = outcome.updated_display;
+                    replaceOptionalOwnedString(allocator, &action_message, outcome.action_message);
+                    number_len = 0;
+                },
+                .quit => return,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (number_len > 0 and rows.selectable_row_indices.len != 0) {
+                            const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                            if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, parsed - 1);
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return;
+                    if (ch == 'k') {
+                        if (cursor_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch == 'j') {
+                        if (cursor_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    if (ch == ' ') {
+                        if (cursor_idx) |idx| {
+                            try toggleOwnedAccountKey(allocator, &checked_account_keys, accountIdForSelectable(&rows, borrowed.reg, idx));
+                            number_len = 0;
+                        }
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        if (rows.selectable_row_indices.len != 0) {
+                            const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                            if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, parsed - 1);
+                            }
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        if (n == 0) return;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (cursor_idx) |idx| {
+                            if (idx > 0) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx - 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .move_down => {
+                        if (cursor_idx) |idx| {
+                            if (idx + 1 < rows.selectable_row_indices.len) {
+                                try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx + 1);
+                                number_len = 0;
+                            }
+                        }
+                    },
+                    .quit => return,
+                    .ignore => {},
+                }
+                i += escape.buffered_bytes_consumed;
+                continue;
+            }
+
+            if (b[i] == '\r' or b[i] == '\n') {
+                if (checked_account_keys.items.len == 0) {
+                    replaceOptionalOwnedString(allocator, &action_message, try allocator.dupe(u8, "No accounts selected"));
+                    continue;
+                }
+                const selected_keys = try allocator.alloc([]const u8, checked_account_keys.items.len);
+                defer allocator.free(selected_keys);
+                for (checked_account_keys.items, 0..) |key, idx| selected_keys[idx] = key;
+                const outcome = controller.apply_selection(controller.refresh.context, allocator, borrowed, selected_keys) catch |err| {
+                    replaceOptionalOwnedString(
+                        allocator,
+                        &action_message,
+                        try std.fmt.allocPrint(allocator, "Delete failed: {s}", .{@errorName(err)}),
+                    );
+                    continue;
+                };
+                clearOwnedAccountKeys(allocator, &checked_account_keys);
+                current_display.deinit(allocator);
+                current_display = outcome.updated_display;
+                replaceOptionalOwnedString(allocator, &action_message, outcome.action_message);
+                number_len = 0;
+                continue;
+            }
+            if (isQuitKey(b[i])) return;
+            if (b[i] == 'k') {
+                if (cursor_idx) |idx| {
+                    if (idx > 0) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx - 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == 'j') {
+                if (cursor_idx) |idx| {
+                    if (idx + 1 < rows.selectable_row_indices.len) {
+                        try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, idx + 1);
+                        number_len = 0;
+                    }
+                }
+                continue;
+            }
+            if (b[i] == ' ') {
+                if (cursor_idx) |idx| {
+                    try toggleOwnedAccountKey(allocator, &checked_account_keys, accountIdForSelectable(&rows, borrowed.reg, idx));
+                    number_len = 0;
+                }
+                continue;
+            }
+            if (b[i] == 0x7f or b[i] == 0x08) {
+                if (number_len > 0) {
+                    number_len -= 1;
+                    if (number_len > 0 and rows.selectable_row_indices.len != 0) {
+                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                        if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, parsed - 1);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (b[i] >= '0' and b[i] <= '9') {
+                if (number_len < number_buf.len) {
+                    number_buf[number_len] = b[i];
+                    number_len += 1;
+                    if (rows.selectable_row_indices.len != 0) {
+                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                        if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                            try replaceSelectedAccountKeyForSelectable(allocator, &cursor_account_key, &rows, borrowed.reg, parsed - 1);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+    }
 }
 
 pub fn selectAccountFromIndices(allocator: std.mem.Allocator, reg: *registry.Registry, indices: []const usize) !?[]const u8 {
@@ -1253,10 +2899,22 @@ pub fn selectAccountFromIndicesWithUsageOverrides(
 ) !?[]const u8 {
     if (indices.len == 0) return null;
     if (indices.len == 1) return reg.accounts.items[indices[0]].account_key;
-    return if (comptime builtin.os.tag == .windows)
-        selectWithNumbersFromIndices(allocator, reg, indices, usage_overrides)
-    else
-        selectInteractiveFromIndices(allocator, reg, indices, usage_overrides) catch selectWithNumbersFromIndices(allocator, reg, indices, usage_overrides);
+    if (shouldUseNumberedSwitchSelector(
+        comptime builtin.os.tag == .windows,
+        std.Io.File.stdin().isTty(app_runtime.io()) catch false,
+        std.Io.File.stdout().isTty(app_runtime.io()) catch false,
+    )) {
+        return selectWithNumbersFromIndices(allocator, reg, indices, usage_overrides);
+    }
+    return selectInteractiveFromIndices(allocator, reg, indices, usage_overrides) catch |err| switch (err) {
+        error.TuiRequiresTty => selectWithNumbersFromIndices(allocator, reg, indices, usage_overrides),
+        else => return err,
+    };
+}
+
+pub fn shouldUseNumberedSwitchSelector(is_windows: bool, stdin_is_tty: bool, stdout_is_tty: bool) bool {
+    _ = is_windows;
+    return !stdin_is_tty or !stdout_is_tty;
 }
 
 pub fn selectAccountsToRemove(allocator: std.mem.Allocator, reg: *registry.Registry) !?[]usize {
@@ -1268,17 +2926,22 @@ pub fn selectAccountsToRemoveWithUsageOverrides(
     reg: *registry.Registry,
     usage_overrides: ?[]const ?[]const u8,
 ) !?[]usize {
-    if (comptime builtin.os.tag == .windows) {
+    if (shouldUseNumberedRemoveSelector(
+        comptime builtin.os.tag == .windows,
+        std.Io.File.stdin().isTty(app_runtime.io()) catch false,
+        std.Io.File.stdout().isTty(app_runtime.io()) catch false,
+    )) {
         return selectRemoveWithNumbers(allocator, reg, usage_overrides);
     }
-    if (shouldUseNumberedRemoveSelector(false, std.Io.File.stdin().isTty(app_runtime.io()) catch false)) {
-        return selectRemoveWithNumbers(allocator, reg, usage_overrides);
-    }
-    return selectRemoveInteractive(allocator, reg, usage_overrides) catch selectRemoveWithNumbers(allocator, reg, usage_overrides);
+    return selectRemoveInteractive(allocator, reg, usage_overrides) catch |err| switch (err) {
+        error.TuiRequiresTty => selectRemoveWithNumbers(allocator, reg, usage_overrides),
+        else => return err,
+    };
 }
 
-pub fn shouldUseNumberedRemoveSelector(is_windows: bool, stdin_is_tty: bool) bool {
-    return is_windows or !stdin_is_tty;
+pub fn shouldUseNumberedRemoveSelector(is_windows: bool, stdin_is_tty: bool, stdout_is_tty: bool) bool {
+    _ = is_windows;
+    return !stdin_is_tty or !stdout_is_tty;
 }
 
 fn isQuitInput(input: []const u8) bool {
@@ -1302,9 +2965,275 @@ fn accountIdForSelectable(rows: *const SwitchRows, reg: *registry.Registry, sele
     return reg.accounts.items[account_idx].account_key;
 }
 
+fn accountRowCount(rows: []const SwitchRow) usize {
+    var count: usize = 0;
+    for (rows) |row| {
+        if (!row.is_header) count += 1;
+    }
+    return count;
+}
+
+fn rowIndexForDisplayedAccount(rows: []const SwitchRow, displayed_idx: usize) ?usize {
+    var current: usize = 0;
+    for (rows, 0..) |row, row_idx| {
+        if (row.is_header) continue;
+        if (current == displayed_idx) return row_idx;
+        current += 1;
+    }
+    return null;
+}
+
+fn displayedIndexForRowIndex(rows: []const SwitchRow, row_idx: usize) ?usize {
+    if (row_idx >= rows.len or rows[row_idx].is_header) return null;
+    var current: usize = 0;
+    for (rows, 0..) |row, idx| {
+        if (row.is_header) continue;
+        if (idx == row_idx) return current;
+        current += 1;
+    }
+    return null;
+}
+
+fn displayedIndexForSelectable(rows: *const SwitchRows, selectable_idx: usize) ?usize {
+    if (selectable_idx >= rows.selectable_row_indices.len) return null;
+    return displayedIndexForRowIndex(rows.items, rows.selectable_row_indices[selectable_idx]);
+}
+
+fn selectableIndexForDisplayedAccount(rows: *const SwitchRows, displayed_idx: usize) ?usize {
+    const row_idx = rowIndexForDisplayedAccount(rows.items, displayed_idx) orelse return null;
+    for (rows.selectable_row_indices, 0..) |selectable_row_idx, selectable_idx| {
+        if (selectable_row_idx == row_idx) return selectable_idx;
+    }
+    return null;
+}
+
+fn accountIdForDisplayedAccount(
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    displayed_idx: usize,
+) ?[]const u8 {
+    const row_idx = rowIndexForDisplayedAccount(rows.items, displayed_idx) orelse return null;
+    const account_idx = rows.items[row_idx].account_index orelse return null;
+    return reg.accounts.items[account_idx].account_key;
+}
+
+fn dupSelectedAccountKeyForDisplayedAccount(
+    allocator: std.mem.Allocator,
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    displayed_idx: usize,
+) !?[]const u8 {
+    const account_key = accountIdForDisplayedAccount(rows, reg, displayed_idx) orelse return null;
+    return try allocator.dupe(u8, account_key);
+}
+
+fn parsedDisplayedIndex(number_input: []const u8, total_accounts: usize) ?usize {
+    if (number_input.len == 0) return null;
+    const parsed = std.fmt.parseInt(usize, number_input, 10) catch return null;
+    if (parsed == 0 or parsed > total_accounts) return null;
+    return parsed - 1;
+}
+
+fn selectedDisplayIndexForRender(
+    rows: *const SwitchRows,
+    selected_selectable_idx: ?usize,
+    number_input: []const u8,
+) ?usize {
+    if (parsedDisplayedIndex(number_input, accountRowCount(rows.items))) |displayed_idx| {
+        return displayed_idx;
+    }
+    if (selected_selectable_idx) |selectable_idx| {
+        return displayedIndexForSelectable(rows, selectable_idx);
+    }
+    return null;
+}
+
+fn numericUsageOverrideStatus(usage_override: ?[]const u8) ?u16 {
+    const value = usage_override orelse return null;
+    return std.fmt.parseInt(u16, value, 10) catch null;
+}
+
+fn accountHasExhaustedUsage(rec: *const registry.AccountRecord, now: i64) bool {
+    const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
+    const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
+    const rem_5h = registry.remainingPercentAt(rate_5h, now);
+    const rem_week = registry.remainingPercentAt(rate_week, now);
+    return (rem_5h != null and rem_5h.? == 0) or (rem_week != null and rem_week.? == 0);
+}
+
+fn shouldAutoSwitchActiveAccount(display: SwitchSelectionDisplay, now: i64) bool {
+    const active_account_key = display.reg.active_account_key orelse return false;
+    const active_idx = registry.findAccountIndexByAccountKey(display.reg, active_account_key) orelse return false;
+
+    if (numericUsageOverrideStatus(usageOverrideForAccount(display.usage_overrides, active_idx))) |status_code| {
+        return status_code != 200;
+    }
+
+    return accountHasExhaustedUsage(&display.reg.accounts.items[active_idx], now);
+}
+
+fn autoSwitchCandidateIsBetter(
+    candidate_score: ?i64,
+    candidate_last_usage_at: ?i64,
+    best_score: ?i64,
+    best_last_usage_at: i64,
+) bool {
+    if (candidate_score != null and best_score == null) return true;
+    if (candidate_score == null and best_score != null) return false;
+    if (candidate_score != null and best_score != null and candidate_score.? != best_score.?) {
+        return candidate_score.? > best_score.?;
+    }
+
+    return (candidate_last_usage_at orelse -1) > best_last_usage_at;
+}
+
+fn bestAutoSwitchCandidateSelectableIndex(
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    now: i64,
+) ?usize {
+    const active_account_key = reg.active_account_key orelse return null;
+
+    var best_selectable_idx: ?usize = null;
+    var best_score: ?i64 = null;
+    var best_last_usage_at: i64 = -1;
+
+    for (rows.selectable_row_indices, 0..) |row_idx, selectable_idx| {
+        const account_idx = rows.items[row_idx].account_index orelse continue;
+        const rec = &reg.accounts.items[account_idx];
+        if (std.mem.eql(u8, rec.account_key, active_account_key)) continue;
+        if (accountHasExhaustedUsage(rec, now)) continue;
+
+        const candidate_score = registry.usageScoreAt(rec.last_usage, now);
+        if (best_selectable_idx == null or autoSwitchCandidateIsBetter(
+            candidate_score,
+            rec.last_usage_at,
+            best_score,
+            best_last_usage_at,
+        )) {
+            best_selectable_idx = selectable_idx;
+            best_score = candidate_score;
+            best_last_usage_at = rec.last_usage_at orelse -1;
+        }
+    }
+
+    return best_selectable_idx;
+}
+
+fn maybeAutoSwitchTargetKeyAlloc(
+    allocator: std.mem.Allocator,
+    display: SwitchSelectionDisplay,
+    rows: *const SwitchRows,
+) !?[]u8 {
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
+    if (!shouldAutoSwitchActiveAccount(display, now)) return null;
+
+    const selectable_idx = bestAutoSwitchCandidateSelectableIndex(rows, display.reg, now) orelse return null;
+    return try accountKeyForSelectableAlloc(allocator, rows, display.reg, selectable_idx);
+}
+
+fn dupSelectedAccountKey(
+    allocator: std.mem.Allocator,
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    selectable_idx: usize,
+) ![]const u8 {
+    return try allocator.dupe(u8, accountIdForSelectable(rows, reg, selectable_idx));
+}
+
+fn dupeOptionalAccountKey(allocator: std.mem.Allocator, account_key: ?[]const u8) !?[]const u8 {
+    return if (account_key) |value| try allocator.dupe(u8, value) else null;
+}
+
 fn accountIndexForSelectable(rows: *const SwitchRows, selectable_idx: usize) usize {
     const row_idx = rows.selectable_row_indices[selectable_idx];
     return rows.items[row_idx].account_index.?;
+}
+
+fn selectableIndexForAccountKey(
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    account_key: []const u8,
+) ?usize {
+    for (rows.selectable_row_indices, 0..) |row_idx, selectable_idx| {
+        const account_idx = rows.items[row_idx].account_index orelse continue;
+        if (std.mem.eql(u8, reg.accounts.items[account_idx].account_key, account_key)) return selectable_idx;
+    }
+    return null;
+}
+
+fn replaceSelectedAccountKeyForSelectable(
+    allocator: std.mem.Allocator,
+    selected_account_key: *?[]u8,
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    selectable_idx: usize,
+) !void {
+    const next_key = try allocator.dupe(u8, accountIdForSelectable(rows, reg, selectable_idx));
+    if (selected_account_key.*) |current_key| allocator.free(current_key);
+    selected_account_key.* = next_key;
+}
+
+fn replaceOptionalOwnedString(
+    allocator: std.mem.Allocator,
+    target: *?[]u8,
+    next: ?[]u8,
+) void {
+    if (target.*) |current| allocator.free(current);
+    target.* = next;
+}
+
+fn accountKeyForSelectableAlloc(
+    allocator: std.mem.Allocator,
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+    selectable_idx: usize,
+) ![]u8 {
+    return try allocator.dupe(u8, accountIdForSelectable(rows, reg, selectable_idx));
+}
+
+fn firstSelectableAccountKeyAlloc(
+    allocator: std.mem.Allocator,
+    rows: *const SwitchRows,
+    reg: *registry.Registry,
+) !?[]u8 {
+    if (rows.selectable_row_indices.len == 0) return null;
+    return try accountKeyForSelectableAlloc(allocator, rows, reg, 0);
+}
+
+fn removeOwnedAccountKey(
+    allocator: std.mem.Allocator,
+    keys: *std.ArrayList([]u8),
+    account_key: []const u8,
+) bool {
+    for (keys.items, 0..) |key, idx| {
+        if (!std.mem.eql(u8, key, account_key)) continue;
+        allocator.free(key);
+        _ = keys.orderedRemove(idx);
+        return true;
+    }
+    return false;
+}
+
+fn containsOwnedAccountKey(keys: *const std.ArrayList([]u8), account_key: []const u8) bool {
+    for (keys.items) |key| {
+        if (std.mem.eql(u8, key, account_key)) return true;
+    }
+    return false;
+}
+
+fn toggleOwnedAccountKey(
+    allocator: std.mem.Allocator,
+    keys: *std.ArrayList([]u8),
+    account_key: []const u8,
+) !void {
+    if (removeOwnedAccountKey(allocator, keys, account_key)) return;
+    try keys.append(allocator, try allocator.dupe(u8, account_key));
+}
+
+fn clearOwnedAccountKeys(allocator: std.mem.Allocator, keys: *std.ArrayList([]u8)) void {
+    for (keys.items) |key| allocator.free(key);
+    keys.clearRetainingCapacity();
 }
 
 fn selectWithNumbers(
@@ -1318,13 +3247,17 @@ fn selectWithNumbers(
     if (reg.accounts.items.len == 0) return null;
     var rows = try buildSwitchRowsWithUsageOverrides(allocator, reg, usage_overrides);
     defer rows.deinit(allocator);
+    try filterErroredRowsFromSelectableIndices(allocator, &rows);
+    const total_accounts = accountRowCount(rows.items);
+    if (total_accounts == 0) return null;
     const use_color = colorEnabled();
     const active_idx = activeSelectableIndex(&rows);
-    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    const idx_width = @max(@as(usize, 2), indexWidth(total_accounts));
     const widths = rows.widths;
+    const active_display_idx = if (active_idx) |idx| displayedIndexForSelectable(&rows, idx) else null;
 
     try out.writeAll("Select account to activate:\n\n");
-    try renderSwitchList(out, reg, rows.items, idx_width, widths, active_idx, use_color);
+    try renderSwitchList(out, reg, rows.items, idx_width, widths, active_display_idx, use_color);
     try out.writeAll("Select account number (or q to quit): ");
     try out.flush();
 
@@ -1336,9 +3269,8 @@ fn selectWithNumbers(
         return null;
     }
     if (isQuitInput(line)) return null;
-    const idx = std.fmt.parseInt(usize, line, 10) catch return null;
-    if (idx == 0 or idx > rows.selectable_row_indices.len) return null;
-    return accountIdForSelectable(&rows, reg, idx - 1);
+    const displayed_idx = parsedDisplayedIndex(line, total_accounts) orelse return null;
+    return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
 }
 
 fn selectWithNumbersFromIndices(
@@ -1354,13 +3286,17 @@ fn selectWithNumbersFromIndices(
 
     var rows = try buildSwitchRowsFromIndicesWithUsageOverrides(allocator, reg, indices, usage_overrides);
     defer rows.deinit(allocator);
+    try filterErroredRowsFromSelectableIndices(allocator, &rows);
+    const total_accounts = accountRowCount(rows.items);
+    if (total_accounts == 0) return null;
     const use_color = colorEnabled();
     const active_idx = activeSelectableIndex(&rows);
-    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    const idx_width = @max(@as(usize, 2), indexWidth(total_accounts));
     const widths = rows.widths;
+    const active_display_idx = if (active_idx) |idx| displayedIndexForSelectable(&rows, idx) else null;
 
     try out.writeAll("Select account to activate:\n\n");
-    try renderSwitchList(out, reg, rows.items, idx_width, widths, active_idx, use_color);
+    try renderSwitchList(out, reg, rows.items, idx_width, widths, active_display_idx, use_color);
     try out.writeAll("Select account number (or q to quit): ");
     try out.flush();
 
@@ -1372,9 +3308,8 @@ fn selectWithNumbersFromIndices(
         return null;
     }
     if (isQuitInput(line)) return null;
-    const idx = std.fmt.parseInt(usize, line, 10) catch return null;
-    if (idx == 0 or idx > rows.selectable_row_indices.len) return null;
-    return accountIdForSelectable(&rows, reg, idx - 1);
+    const displayed_idx = parsedDisplayedIndex(line, total_accounts) orelse return null;
+    return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
 }
 
 fn selectInteractiveFromIndices(
@@ -1386,77 +3321,147 @@ fn selectInteractiveFromIndices(
     if (indices.len == 0) return null;
     var rows = try buildSwitchRowsFromIndicesWithUsageOverrides(allocator, reg, indices, usage_overrides);
     defer rows.deinit(allocator);
+    try filterErroredRowsFromSelectableIndices(allocator, &rows);
+    const total_accounts = accountRowCount(rows.items);
+    if (total_accounts == 0) return null;
 
-    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
-    defer tty.close(app_runtime.io());
-
-    const term = try std.posix.tcgetattr(tty.handle);
-    var raw = term;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-    try std.posix.tcsetattr(tty.handle, .FLUSH, raw);
-    defer std.posix.tcsetattr(tty.handle, .FLUSH, term) catch {};
-
-    var stdout: io_util.Stdout = undefined;
-    stdout.init();
-    const out = stdout.out();
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+    const out = tui.out();
     const active_idx = activeSelectableIndex(&rows);
     var idx: usize = active_idx orelse 0;
     var number_buf: [8]u8 = undefined;
     var number_len: usize = 0;
-    const use_color = colorEnabled();
-    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const idx_width = @max(@as(usize, 2), indexWidth(total_accounts));
     const widths = rows.widths;
 
     while (true) {
-        try out.writeAll("\x1b[2J\x1b[H");
-        try out.writeAll("Select account to activate:\n\n");
-        try renderSwitchList(out, reg, rows.items, idx_width, widths, idx, use_color);
-        try out.writeAll("\n");
-        if (use_color) try out.writeAll(ansi.dim);
-        try out.writeAll("Keys: ↑/↓ or j/k, Enter select, 1-9 type, Backspace edit, Esc or q quit\n");
-        if (use_color) try out.writeAll(ansi.reset);
+        const selected_display_idx = selectedDisplayIndexForRender(
+            &rows,
+            if (rows.selectable_row_indices.len != 0) idx else null,
+            number_buf[0..number_len],
+        );
+        try tui.resetFrame();
+        try renderSwitchScreen(
+            out,
+            reg,
+            rows.items,
+            idx_width,
+            widths,
+            selected_display_idx,
+            use_color,
+            "",
+            "",
+            number_buf[0..number_len],
+        );
         try out.flush();
 
-        var b: [8]u8 = undefined;
-        const n = try readFileOnce(tty, &b);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (b[i] == 0x1b) {
-                if (i + 2 < n and b[i + 1] == '[') {
-                    const code = b[i + 2];
-                    if (code == 'A' and idx > 0) {
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (rows.selectable_row_indices.len != 0 and idx > 0) {
                         idx -= 1;
                         number_len = 0;
-                    } else if (code == 'B' and idx + 1 < rows.selectable_row_indices.len) {
+                    }
+                },
+                .move_down => {
+                    if (rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
                         idx += 1;
                         number_len = 0;
                     }
-                    i += 2;
-                    continue;
+                },
+                .enter => {
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
+                    }
+                    if (rows.selectable_row_indices.len == 0) return null;
+                    return accountIdForSelectable(&rows, reg, idx);
+                },
+                .quit => return null,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                idx = selectable_idx;
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return null;
+                    if (ch == 'k' and rows.selectable_row_indices.len != 0 and idx > 0) {
+                        idx -= 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch == 'j' and rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
+                        idx += 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                idx = selectable_idx;
+                            }
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (rows.selectable_row_indices.len != 0 and idx > 0) {
+                            idx -= 1;
+                            number_len = 0;
+                        }
+                    },
+                    .move_down => {
+                        if (rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
+                            idx += 1;
+                            number_len = 0;
+                        }
+                    },
+                    .quit => return null,
+                    .ignore => {},
                 }
-                return null;
+                i += escape.buffered_bytes_consumed;
+                continue;
             }
 
             if (b[i] == '\r' or b[i] == '\n') {
-                if (number_len > 0) {
-                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                    if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                        return accountIdForSelectable(&rows, reg, parsed - 1);
-                    }
+                if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                    return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
                 }
+                if (rows.selectable_row_indices.len == 0) return null;
                 return accountIdForSelectable(&rows, reg, idx);
             }
             if (isQuitKey(b[i])) return null;
 
-            if (b[i] == 'k' and idx > 0) {
+            if (b[i] == 'k' and rows.selectable_row_indices.len != 0 and idx > 0) {
                 idx -= 1;
                 number_len = 0;
                 continue;
             }
-            if (b[i] == 'j' and idx + 1 < rows.selectable_row_indices.len) {
+            if (b[i] == 'j' and rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
                 idx += 1;
                 number_len = 0;
                 continue;
@@ -1464,10 +3469,9 @@ fn selectInteractiveFromIndices(
             if (b[i] == 0x7f or b[i] == 0x08) {
                 if (number_len > 0) {
                     number_len -= 1;
-                    if (number_len > 0) {
-                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                        if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                            idx = parsed - 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            idx = selectable_idx;
                         }
                     }
                 }
@@ -1477,9 +3481,10 @@ fn selectInteractiveFromIndices(
                 if (number_len < number_buf.len) {
                     number_buf[number_len] = b[i];
                     number_len += 1;
-                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                    if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                        idx = parsed - 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            idx = selectable_idx;
+                        }
                     }
                 }
                 continue;
@@ -1569,76 +3574,146 @@ fn selectInteractive(
     if (reg.accounts.items.len == 0) return null;
     var rows = try buildSwitchRowsWithUsageOverrides(allocator, reg, usage_overrides);
     defer rows.deinit(allocator);
+    try filterErroredRowsFromSelectableIndices(allocator, &rows);
+    const total_accounts = accountRowCount(rows.items);
+    if (total_accounts == 0) return null;
 
-    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
-    defer tty.close(app_runtime.io());
-
-    const term = try std.posix.tcgetattr(tty.handle);
-    var raw = term;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-    try std.posix.tcsetattr(tty.handle, .FLUSH, raw);
-    defer std.posix.tcsetattr(tty.handle, .FLUSH, term) catch {};
-
-    var stdout: io_util.Stdout = undefined;
-    stdout.init();
-    const out = stdout.out();
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+    const out = tui.out();
     const active_idx = activeSelectableIndex(&rows);
     var idx: usize = active_idx orelse 0;
     var number_buf: [8]u8 = undefined;
     var number_len: usize = 0;
-    const use_color = colorEnabled();
-    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    const use_color = terminal_color.fileColorEnabled(tui.output);
+    const idx_width = @max(@as(usize, 2), indexWidth(total_accounts));
     const widths = rows.widths;
 
     while (true) {
-        try out.writeAll("\x1b[2J\x1b[H");
-        try out.writeAll("Select account to activate:\n\n");
-        try renderSwitchList(out, reg, rows.items, idx_width, widths, idx, use_color);
-        try out.writeAll("\n");
-        if (use_color) try out.writeAll(ansi.dim);
-        try out.writeAll("Keys: ↑/↓ or j/k, Enter select, 1-9 type, Backspace edit, Esc or q quit\n");
-        if (use_color) try out.writeAll(ansi.reset);
+        const selected_display_idx = selectedDisplayIndexForRender(
+            &rows,
+            if (rows.selectable_row_indices.len != 0) idx else null,
+            number_buf[0..number_len],
+        );
+        try tui.resetFrame();
+        try renderSwitchScreen(
+            out,
+            reg,
+            rows.items,
+            idx_width,
+            widths,
+            selected_display_idx,
+            use_color,
+            "",
+            "",
+            number_buf[0..number_len],
+        );
         try out.flush();
 
-        var b: [8]u8 = undefined;
-        const n = try readFileOnce(tty, &b);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (b[i] == 0x1b) {
-                if (i + 2 < n and b[i + 1] == '[') {
-                    const code = b[i + 2];
-                    if (code == 'A' and idx > 0) {
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (rows.selectable_row_indices.len != 0 and idx > 0) {
                         idx -= 1;
                         number_len = 0;
-                    } else if (code == 'B' and idx + 1 < rows.selectable_row_indices.len) {
+                    }
+                },
+                .move_down => {
+                    if (rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
                         idx += 1;
                         number_len = 0;
                     }
-                    i += 2;
-                    continue;
+                },
+                .enter => {
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
+                    }
+                    if (rows.selectable_row_indices.len == 0) return null;
+                    return accountIdForSelectable(&rows, reg, idx);
+                },
+                .quit => return null,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                idx = selectable_idx;
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return null;
+                    if (ch == 'k' and rows.selectable_row_indices.len != 0 and idx > 0) {
+                        idx -= 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch == 'j' and rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
+                        idx += 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                            if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                                idx = selectable_idx;
+                            }
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (rows.selectable_row_indices.len != 0 and idx > 0) {
+                            idx -= 1;
+                            number_len = 0;
+                        }
+                    },
+                    .move_down => {
+                        if (rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
+                            idx += 1;
+                            number_len = 0;
+                        }
+                    },
+                    .quit => return null,
+                    .ignore => {},
                 }
-                return null;
+                i += escape.buffered_bytes_consumed;
+                continue;
             }
 
             if (b[i] == '\r' or b[i] == '\n') {
-                if (number_len > 0) {
-                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                    if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                        return accountIdForSelectable(&rows, reg, parsed - 1);
-                    }
+                if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                    return accountIdForDisplayedAccount(&rows, reg, displayed_idx);
                 }
+                if (rows.selectable_row_indices.len == 0) return null;
                 return accountIdForSelectable(&rows, reg, idx);
             }
             if (isQuitKey(b[i])) return null;
-            if (b[i] == 'k' and idx > 0) {
+            if (b[i] == 'k' and rows.selectable_row_indices.len != 0 and idx > 0) {
                 idx -= 1;
                 number_len = 0;
                 continue;
             }
-            if (b[i] == 'j' and idx + 1 < rows.selectable_row_indices.len) {
+            if (b[i] == 'j' and rows.selectable_row_indices.len != 0 and idx + 1 < rows.selectable_row_indices.len) {
                 idx += 1;
                 number_len = 0;
                 continue;
@@ -1646,10 +3721,9 @@ fn selectInteractive(
             if (b[i] == 0x7f or b[i] == 0x08) {
                 if (number_len > 0) {
                     number_len -= 1;
-                    if (number_len > 0) {
-                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                        if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                            idx = parsed - 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            idx = selectable_idx;
                         }
                     }
                 }
@@ -1659,9 +3733,10 @@ fn selectInteractive(
                 if (number_len < number_buf.len) {
                     number_buf[number_len] = b[i];
                     number_len += 1;
-                    const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
-                    if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
-                        idx = parsed - 1;
+                    if (parsedDisplayedIndex(number_buf[0..number_len], total_accounts)) |displayed_idx| {
+                        if (selectableIndexForDisplayedAccount(&rows, displayed_idx)) |selectable_idx| {
+                            idx = selectable_idx;
+                        }
                     }
                 }
                 continue;
@@ -1679,60 +3754,130 @@ fn selectRemoveInteractive(
     var rows = try buildSwitchRowsWithUsageOverrides(allocator, reg, usage_overrides);
     defer rows.deinit(allocator);
 
-    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
-    defer tty.close(app_runtime.io());
-
-    const term = try std.posix.tcgetattr(tty.handle);
-    var raw = term;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-    try std.posix.tcsetattr(tty.handle, .FLUSH, raw);
-    defer std.posix.tcsetattr(tty.handle, .FLUSH, term) catch {};
-
     var checked = try allocator.alloc(bool, rows.selectable_row_indices.len);
     defer allocator.free(checked);
     @memset(checked, false);
 
-    var stdout: io_util.Stdout = undefined;
-    stdout.init();
-    const out = stdout.out();
+    var tui = try TuiSession.init();
+    defer tui.deinit();
+    const out = tui.out();
     var idx: usize = 0;
     var number_buf: [8]u8 = undefined;
     var number_len: usize = 0;
-    const use_color = colorEnabled();
+    const use_color = terminal_color.fileColorEnabled(tui.output);
     const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
     const widths = rows.widths;
 
     while (true) {
-        try out.writeAll("\x1b[2J\x1b[H");
-        try out.writeAll("Select accounts to delete:\n\n");
+        try tui.resetFrame();
+        try writeTuiPromptLine(out, "Select accounts to delete:", number_buf[0..number_len]);
+        try out.writeAll("\n");
         try renderRemoveList(out, reg, rows.items, idx_width, widths, idx, checked, use_color);
         try out.writeAll("\n");
-        if (use_color) try out.writeAll(ansi.dim);
-        try out.writeAll("Keys: ↑/↓ or j/k move, Space toggle, Enter delete, 1-9 type, Backspace edit, Esc or q quit\n");
-        if (use_color) try out.writeAll(ansi.reset);
+        try writeRemoveTuiFooter(out, use_color);
         try out.flush();
 
-        var b: [8]u8 = undefined;
-        const n = try readFileOnce(tty, &b);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (b[i] == 0x1b) {
-                if (i + 2 < n and b[i + 1] == '[') {
-                    const code = b[i + 2];
-                    if (code == 'A' and idx > 0) {
+        if (comptime builtin.os.tag == .windows) {
+            switch (try tui.readWindowsKey()) {
+                .move_up => {
+                    if (idx > 0) {
                         idx -= 1;
                         number_len = 0;
-                    } else if (code == 'B' and idx + 1 < rows.selectable_row_indices.len) {
+                    }
+                },
+                .move_down => {
+                    if (idx + 1 < rows.selectable_row_indices.len) {
                         idx += 1;
                         number_len = 0;
                     }
-                    i += 2;
-                    continue;
+                },
+                .enter => {
+                    var count: usize = 0;
+                    for (checked) |flag| {
+                        if (flag) count += 1;
+                    }
+                    if (count == 0) return null;
+                    var selected = try allocator.alloc(usize, count);
+                    var out_idx: usize = 0;
+                    for (checked, 0..) |flag, sel_idx| {
+                        if (!flag) continue;
+                        selected[out_idx] = accountIndexForSelectable(&rows, sel_idx);
+                        out_idx += 1;
+                    }
+                    return selected;
+                },
+                .quit => return null,
+                .backspace => {
+                    if (number_len > 0) {
+                        number_len -= 1;
+                        if (number_len > 0) {
+                            const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                            if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                                idx = parsed - 1;
+                            }
+                        }
+                    }
+                },
+                .redraw => continue,
+                .byte => |ch| {
+                    if (isQuitKey(ch)) return null;
+                    if (ch == 'k' and idx > 0) {
+                        idx -= 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch == 'j' and idx + 1 < rows.selectable_row_indices.len) {
+                        idx += 1;
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch == ' ') {
+                        checked[idx] = !checked[idx];
+                        number_len = 0;
+                        continue;
+                    }
+                    if (ch >= '0' and ch <= '9' and number_len < number_buf.len) {
+                        number_buf[number_len] = ch;
+                        number_len += 1;
+                        const parsed = std.fmt.parseInt(usize, number_buf[0..number_len], 10) catch 0;
+                        if (parsed >= 1 and parsed <= rows.selectable_row_indices.len) {
+                            idx = parsed - 1;
+                        }
+                    }
+                },
+            }
+            continue;
+        }
+
+        var b: [8]u8 = undefined;
+        const n = try tui.read(&b);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (b[i] == 0x1b) {
+                const escape = try readTuiEscapeAction(
+                    tui.input,
+                    b[i + 1 .. n],
+                    tui_poll_error_mask,
+                    tui_escape_sequence_timeout_ms,
+                );
+                switch (escape.action) {
+                    .move_up => {
+                        if (idx > 0) {
+                            idx -= 1;
+                            number_len = 0;
+                        }
+                    },
+                    .move_down => {
+                        if (idx + 1 < rows.selectable_row_indices.len) {
+                            idx += 1;
+                            number_len = 0;
+                        }
+                    },
+                    .quit => return null,
+                    .ignore => {},
                 }
-                return null;
+                i += escape.buffered_bytes_consumed;
+                continue;
             }
 
             if (b[i] == '\r' or b[i] == '\n') {
@@ -1793,6 +3938,90 @@ fn selectRemoveInteractive(
     }
 }
 
+fn renderSwitchScreen(
+    out: *std.Io.Writer,
+    reg: *registry.Registry,
+    rows: []const SwitchRow,
+    idx_width: usize,
+    widths: SwitchWidths,
+    selected: ?usize,
+    use_color: bool,
+    status_line: []const u8,
+    action_line: []const u8,
+    number_input: []const u8,
+) !void {
+    try writeTuiPromptLine(out, "Select account to activate:", number_input);
+    try out.writeAll("\n");
+    try renderSwitchList(out, reg, rows, idx_width, widths, selected, use_color);
+    try out.writeAll("\n");
+    if (status_line.len != 0) {
+        if (use_color) try out.writeAll(ansi.dim);
+        try out.writeAll(status_line);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.reset);
+    }
+    try writeSwitchTuiFooter(out, use_color);
+    if (action_line.len != 0) {
+        if (use_color) try out.writeAll(ansi.bold_green);
+        try out.writeAll(action_line);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.reset);
+    }
+}
+
+fn renderListScreen(
+    out: *std.Io.Writer,
+    reg: *registry.Registry,
+    rows: []const SwitchRow,
+    idx_width: usize,
+    widths: SwitchWidths,
+    use_color: bool,
+    status_line: []const u8,
+) !void {
+    try out.writeAll("Live account list:\n\n");
+    try renderSwitchList(out, reg, rows, idx_width, widths, null, use_color);
+    try out.writeAll("\n");
+    if (status_line.len != 0) {
+        if (use_color) try out.writeAll(ansi.dim);
+        try out.writeAll(status_line);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.reset);
+    }
+    try writeListTuiFooter(out, use_color);
+}
+
+fn renderRemoveScreen(
+    out: *std.Io.Writer,
+    reg: *registry.Registry,
+    rows: []const SwitchRow,
+    idx_width: usize,
+    widths: SwitchWidths,
+    cursor: ?usize,
+    checked: []const bool,
+    use_color: bool,
+    status_line: []const u8,
+    action_line: []const u8,
+    number_input: []const u8,
+) !void {
+    try writeTuiPromptLine(out, "Select accounts to delete:", number_input);
+    try out.writeAll("\n");
+    try renderRemoveList(out, reg, rows, idx_width, widths, cursor, checked, use_color);
+    try out.writeAll("\n");
+    if (status_line.len != 0) {
+        if (use_color) try out.writeAll(ansi.dim);
+        try out.writeAll(status_line);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.reset);
+    }
+    try writeRemoveTuiFooter(out, use_color);
+    if (action_line.len != 0) {
+        if (use_color) try out.writeAll(ansi.bold_green);
+        try out.writeAll(action_line);
+        try out.writeAll("\n");
+        if (use_color) try out.writeAll(ansi.reset);
+    }
+}
+
 fn renderSwitchList(
     out: *std.Io.Writer,
     reg: *registry.Registry,
@@ -1819,7 +4048,7 @@ fn renderSwitchList(
     try writePadded(out, "LAST", widths.last);
     try out.writeAll("\n");
 
-    var selectable_counter: usize = 0;
+    var displayed_counter: usize = 0;
     for (rows) |row| {
         if (row.is_header) {
             if (use_color) try out.writeAll(ansi.dim);
@@ -1834,7 +4063,7 @@ fn renderSwitchList(
             continue;
         }
 
-        const is_selected = selected != null and selected.? == selectable_counter;
+        const is_selected = selected != null and selected.? == displayed_counter;
         const is_active = row.is_active;
         if (use_color) {
             if (row.has_error) {
@@ -1851,8 +4080,8 @@ fn renderSwitchList(
                 try out.writeAll(ansi.dim);
             }
         }
-        try out.writeAll(if (is_selected) "> " else "  ");
-        try writeIndexPadded(out, selectable_counter + 1, idx_width);
+        try out.writeAll(activeRowMarker(is_selected, is_active));
+        try writeIndexPadded(out, displayed_counter + 1, idx_width);
         try out.writeAll(" ");
         const indent: usize = @as(usize, row.depth) * 2;
         const indent_to_print: usize = @min(indent, widths.email);
@@ -1866,12 +4095,9 @@ fn renderSwitchList(
         try writeTruncatedPadded(out, row.rate_week, widths.rate_week);
         try out.writeAll("  ");
         try writeTruncatedPadded(out, row.last, widths.last);
-        if (is_active) {
-            try out.writeAll("  [ACTIVE]");
-        }
         try out.writeAll("\n");
         if (use_color) try out.writeAll(ansi.reset);
-        selectable_counter += 1;
+        displayed_counter += 1;
     }
 }
 
@@ -1936,7 +4162,7 @@ fn renderRemoveList(
                 try out.writeAll(ansi.dim);
             }
         }
-        try out.writeAll(if (is_cursor) "> " else "  ");
+        try out.writeAll(activeRowMarker(is_cursor, is_active));
         try out.writeAll(if (is_checked) "[x]" else "[ ]");
         try out.writeAll(" ");
         try writeIndexPadded(out, selectable_counter + 1, idx_width);
@@ -1953,9 +4179,6 @@ fn renderRemoveList(
         try writeTruncatedPadded(out, row.rate_week, widths.rate_week);
         try out.writeAll("  ");
         try writeTruncatedPadded(out, row.last, widths.last);
-        if (is_active) {
-            try out.writeAll("  [ACTIVE]");
-        }
         try out.writeAll("\n");
         if (use_color) try out.writeAll(ansi.reset);
         selectable_counter += 1;
@@ -2044,6 +4267,24 @@ const SwitchRows = struct {
         allocator.free(self.selectable_row_indices);
     }
 };
+
+fn filterErroredRowsFromSelectableIndices(allocator: std.mem.Allocator, rows: *SwitchRows) !void {
+    var selectable_count: usize = 0;
+    for (rows.selectable_row_indices) |row_idx| {
+        if (!rows.items[row_idx].has_error) selectable_count += 1;
+    }
+
+    const filtered = try allocator.alloc(usize, selectable_count);
+    var next_idx: usize = 0;
+    for (rows.selectable_row_indices) |row_idx| {
+        if (rows.items[row_idx].has_error) continue;
+        filtered[next_idx] = row_idx;
+        next_idx += 1;
+    }
+
+    allocator.free(rows.selectable_row_indices);
+    rows.selectable_row_indices = filtered;
+}
 
 fn usageOverrideForAccount(
     usage_overrides: ?[]const ?[]const u8,
@@ -2384,6 +4625,23 @@ fn appendTestAccount(
     });
 }
 
+fn testUsageSnapshot(now: i64, used_5h: f64, used_weekly: f64) registry.RateLimitSnapshot {
+    return .{
+        .primary = .{
+            .used_percent = used_5h,
+            .window_minutes = 300,
+            .resets_at = now + 3600,
+        },
+        .secondary = .{
+            .used_percent = used_weekly,
+            .window_minutes = 10080,
+            .resets_at = now + 7 * 24 * 3600,
+        },
+        .credits = null,
+        .plan_type = .pro,
+    };
+}
+
 test "Scenario: Given grouped accounts when rendering switch list then child rows keep indentation" {
     const gpa = std.testing.allocator;
     var reg = makeTestRegistry();
@@ -2425,6 +4683,321 @@ test "Scenario: Given usage overrides when rendering switch list then failed row
 
     const output = writer.buffered();
     try std.testing.expect(std.mem.count(u8, output, "401") >= 2);
+}
+
+test "Scenario: Given usage overrides when selecting switch accounts then errored rows are skipped" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "healthy@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "failed@example.com", "", .free);
+
+    const usage_overrides = [_]?[]const u8{ null, "401" };
+    var rows = try buildSwitchRowsWithUsageOverrides(gpa, &reg, &usage_overrides);
+    defer rows.deinit(gpa);
+    try filterErroredRowsFromSelectableIndices(gpa, &rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.selectable_row_indices.len);
+    try std.testing.expect(std.mem.eql(u8, accountIdForSelectable(&rows, &reg, 0), "user-1::acc-1"));
+}
+
+test "Scenario: Given exhausted active usage when picking an auto-switch target then the best healthy candidate is chosen" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "active@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "backup-a@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-3", "backup-b@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-1");
+    reg.accounts.items[0].last_usage = testUsageSnapshot(now, 100, 10);
+    reg.accounts.items[1].last_usage = testUsageSnapshot(now, 35, 15);
+    reg.accounts.items[2].last_usage = testUsageSnapshot(now, 5, 8);
+
+    var rows = try buildSwitchRowsWithUsageOverrides(gpa, &reg, null);
+    defer rows.deinit(gpa);
+    try filterErroredRowsFromSelectableIndices(gpa, &rows);
+
+    const target_key = try maybeAutoSwitchTargetKeyAlloc(gpa, .{
+        .reg = &reg,
+        .usage_overrides = null,
+    }, &rows);
+    defer if (target_key) |value| gpa.free(value);
+
+    try std.testing.expect(target_key != null);
+    try std.testing.expectEqualStrings("user-1::acc-3", target_key.?);
+}
+
+test "Scenario: Given an active api status error when picking an auto-switch target then a healthy candidate is chosen" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "active@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "backup@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-1");
+    reg.accounts.items[0].last_usage = testUsageSnapshot(now, 20, 20);
+    reg.accounts.items[1].last_usage = testUsageSnapshot(now, 10, 10);
+
+    const usage_overrides = [_]?[]const u8{ "403", null };
+    var rows = try buildSwitchRowsWithUsageOverrides(gpa, &reg, &usage_overrides);
+    defer rows.deinit(gpa);
+    try filterErroredRowsFromSelectableIndices(gpa, &rows);
+
+    const target_key = try maybeAutoSwitchTargetKeyAlloc(gpa, .{
+        .reg = &reg,
+        .usage_overrides = &usage_overrides,
+    }, &rows);
+    defer if (target_key) |value| gpa.free(value);
+
+    try std.testing.expect(target_key != null);
+    try std.testing.expectEqualStrings("user-1::acc-2", target_key.?);
+}
+
+test "Scenario: Given only exhausted candidates when picking an auto-switch target then no target is returned" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "active@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "backup@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-1");
+    reg.accounts.items[0].last_usage = testUsageSnapshot(now, 100, 10);
+    reg.accounts.items[1].last_usage = testUsageSnapshot(now, 100, 100);
+
+    var rows = try buildSwitchRowsWithUsageOverrides(gpa, &reg, null);
+    defer rows.deinit(gpa);
+    try filterErroredRowsFromSelectableIndices(gpa, &rows);
+
+    const target_key = try maybeAutoSwitchTargetKeyAlloc(gpa, .{
+        .reg = &reg,
+        .usage_overrides = null,
+    }, &rows);
+    defer if (target_key) |value| gpa.free(value);
+
+    try std.testing.expect(target_key == null);
+}
+
+test "Scenario: Given usage overrides when rendering switch list then errored rows still show full display numbers" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "healthy@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "failed@example.com", "", .free);
+
+    const usage_overrides = [_]?[]const u8{ null, "401" };
+    var rows = try buildSwitchRowsWithUsageOverrides(gpa, &reg, &usage_overrides);
+    defer rows.deinit(gpa);
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    try renderSwitchList(&writer, &reg, rows.items, idx_width, rows.widths, null, false);
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "01 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "02 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "healthy@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "failed@example.com") != null);
+}
+
+test "Scenario: Given an active account when rendering switch list then non-selected active rows use the list marker" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "selected@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "active@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-2");
+
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    var selected_displayed_idx: ?usize = null;
+    for (rows.selectable_row_indices, 0..) |row_idx, selectable_idx| {
+        const account_idx = rows.items[row_idx].account_index.?;
+        if (std.mem.eql(u8, reg.accounts.items[account_idx].account_key, "user-1::acc-1")) {
+            selected_displayed_idx = displayedIndexForSelectable(&rows, selectable_idx);
+            break;
+        }
+    }
+
+    try std.testing.expect(selected_displayed_idx != null);
+    try renderSwitchList(&writer, &reg, rows.items, idx_width, rows.widths, selected_displayed_idx.?, false);
+
+    const output = writer.buffered();
+    var expected_selected_line_buf: [128]u8 = undefined;
+    const expected_selected_line = try std.fmt.bufPrint(
+        &expected_selected_line_buf,
+        "> {d:0>2} selected@example.com",
+        .{selected_displayed_idx.? + 1},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output, expected_selected_line) != null);
+
+    const active_displayed_idx = displayedIndexForSelectable(&rows, activeSelectableIndex(&rows).?).?;
+    var expected_active_line_buf: [128]u8 = undefined;
+    const expected_active_line = try std.fmt.bufPrint(
+        &expected_active_line_buf,
+        "* {d:0>2} active@example.com",
+        .{active_displayed_idx + 1},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output, expected_active_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[ACTIVE]") == null);
+}
+
+test "Scenario: Given the active account is selected when rendering switch list then the cursor marker wins" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "active@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "other@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-1");
+
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    try renderSwitchList(&writer, &reg, rows.items, idx_width, rows.widths, 0, false);
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "> 01 active@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "* 01 active@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[ACTIVE]") == null);
+}
+
+test "Scenario: Given an active account when rendering remove list then non-cursor active rows use the list marker" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "cursor@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "active@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-2");
+
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    var checked = [_]bool{ false, false };
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    const cursor_idx = selectableIndexForAccountKey(&rows, &reg, "user-1::acc-1").?;
+    try renderRemoveList(&writer, &reg, rows.items, idx_width, rows.widths, cursor_idx, &checked, false);
+
+    const output = writer.buffered();
+    var expected_cursor_line_buf: [128]u8 = undefined;
+    const expected_cursor_line = try std.fmt.bufPrint(
+        &expected_cursor_line_buf,
+        "> [ ] {d:0>2} cursor@example.com",
+        .{cursor_idx + 1},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output, expected_cursor_line) != null);
+
+    const active_idx = selectableIndexForAccountKey(&rows, &reg, "user-1::acc-2").?;
+    var expected_active_line_buf: [128]u8 = undefined;
+    const expected_active_line = try std.fmt.bufPrint(
+        &expected_active_line_buf,
+        "* [ ] {d:0>2} active@example.com",
+        .{active_idx + 1},
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output, expected_active_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[ACTIVE]") == null);
+}
+
+test "Scenario: Given the active account is the remove cursor then the cursor marker wins" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "active@example.com", "", .team);
+    try appendTestAccount(gpa, &reg, "user-1::acc-2", "other@example.com", "", .team);
+    reg.active_account_key = try gpa.dupe(u8, "user-1::acc-1");
+
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    var checked = [_]bool{ false, false };
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const idx_width = @max(@as(usize, 2), indexWidth(rows.selectable_row_indices.len));
+    try renderRemoveList(&writer, &reg, rows.items, idx_width, rows.widths, 0, &checked, false);
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "> [ ] 01 active@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "* [ ] 01 active@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[ACTIVE]") == null);
+}
+
+test "Scenario: Given switch live feedback when rendering switch screen then the action message stays below the footer" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "healthy@example.com", "", .team);
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try renderSwitchScreen(
+        &writer,
+        &reg,
+        rows.items,
+        @max(@as(usize, 2), indexWidth(accountRowCount(rows.items))),
+        rows.widths,
+        0,
+        false,
+        "Live refresh: api | Refresh in 9s",
+        "Switched to healthy@example.com",
+        "",
+    );
+
+    const output = writer.buffered();
+    const footer_pos = std.mem.indexOf(u8, output, "Keys:") orelse return error.TestExpectedEqual;
+    const action_pos = std.mem.indexOf(u8, output, "Switched to healthy@example.com") orelse return error.TestExpectedEqual;
+    try std.testing.expect(action_pos > footer_pos);
+}
+
+test "Scenario: Given Windows console labels when rendering unicode-prone output then ASCII fallbacks are used" {
+    try std.testing.expectEqualStrings(
+        "Keys: Up/Down or j/k, 1-9 type, Enter select, Esc or q quit\n",
+        switchTuiFooterText(true),
+    );
+    try std.testing.expectEqualStrings(
+        "Keys: Up/Down or j/k move, Space toggle, 1-9 type, Enter delete, Esc or q quit\n",
+        removeTuiFooterText(true),
+    );
+    try std.testing.expectEqualStrings("[+]", importReportMarker(.imported, true));
+    try std.testing.expectEqualStrings("[~]", importReportMarker(.updated, true));
+    try std.testing.expectEqualStrings("[x]", importReportMarker(.skipped, true));
+}
+
+test "Scenario: Given non-Windows console labels when rendering unicode-prone output then the richer glyphs remain" {
+    try std.testing.expectEqualStrings(
+        "Keys: ↑/↓ or j/k, 1-9 type, Enter select, Esc or q quit\n",
+        switchTuiFooterText(false),
+    );
+    try std.testing.expectEqualStrings(
+        "Keys: ↑/↓ or j/k move, Space toggle, 1-9 type, Enter delete, Esc or q quit\n",
+        removeTuiFooterText(false),
+    );
+    try std.testing.expectEqualStrings("✓", importReportMarker(.imported, false));
+    try std.testing.expectEqualStrings("✓", importReportMarker(.updated, false));
+    try std.testing.expectEqualStrings("✗", importReportMarker(.skipped, false));
 }
 
 test "Scenario: Given usage overrides when rendering remove list then failed rows show response status in both usage columns" {

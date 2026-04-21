@@ -152,9 +152,10 @@ Important limits:
 
 ## Switching Accounts
 
-`switch` supports two modes:
+`switch` supports three foreground forms:
 
-- Interactive: `codex-auth switch`
+- Interactive: `codex-auth switch [--api|--skip-api]`
+- Interactive live: `codex-auth switch --live [--auto] [--api|--skip-api]`
 - Non-interactive: `codex-auth switch <query>`
 
 For non-interactive switching, the target account is matched case-insensitively by:
@@ -171,13 +172,33 @@ When switching:
 2. The selected account’s `accounts/<account file key>.auth.json` is copied to `~/.codex/auth.json`.
 3. The registry’s `active_account_key` is updated to that account’s `record_key`.
 
-When `api.usage = true`, interactive `codex-auth switch` refreshes usage for all stored accounts before rendering account choices, using a maximum concurrency of `3`. When a per-account foreground usage request returns a non-`200` HTTP status, the picker shows that status in both usage columns for that row. When a stored account snapshot cannot make a ChatGPT usage request because the required ChatGPT auth fields are missing, the picker shows `MissingAuth` in both usage columns for that row. No extra usage refresh is attempted after the switch completes.
+Interactive `codex-auth switch` now follows the same foreground refresh mode as `list`. By default it honors the stored `api.usage` and `api.account` settings. When foreground refresh is enabled, the picker refreshes stored accounts before rendering and can show the same usage overlays as `list`, including numeric non-`200` statuses such as `401` / `403` and `MissingAuth`.
 
-When `api.usage = false`, interactive `codex-auth switch` keeps the existing local-only behavior and can refresh only the active account from the newest local rollout data.
+`codex-auth switch --api` forces that foreground refresh path for the command even when config is disabled. `codex-auth switch --skip-api` disables the foreground API refresh path. In single-shot mode it renders the stored registry picker directly; in `switch --live --skip-api`, only the active account can refresh from local rollout data while non-active rows still come from the stored registry snapshot.
 
-`codex-auth switch <query>` now stays local-only: it resolves matches from the stored registry, switches immediately on a single match, and does not wait for foreground usage or account-name API refresh before switching.
+`codex-auth switch --live` keeps the picker open after each successful switch. The live picker follows the same default/API-override rules as `list --live`: the initial render and scheduled refresh rounds use the configured foreground refresh mode, while a successful live switch action patches the current live display in memory so the switch completes promptly without waiting for another full foreground refresh.
 
-Grouped account-name metadata refresh, when needed, now runs in the same foreground pre-selection phase as the interactive picker path; see [docs/api-refresh.md](./api-refresh.md).
+After a live switch action:
+
+- the in-flight refresh result, if any, is discarded
+- the current live display keeps the existing row overlays until the next scheduled refresh, including any existing `401` / `403` / `MissingAuth` or other usage overlay on the newly active row
+- the newly active account in the patched display is taken from the persisted `registry.json` state after the local switch succeeds
+- the `Switched to ...` message is built from that persisted registry entry as well
+- the next scheduled live refresh reapplies the current API-backed or local-rollout overlays asynchronously
+
+`codex-auth switch --live --auto` adds a foreground auto-switch loop on top of the live picker. It does not use the background watcher thresholds from `config auto`. Instead, it switches only when the currently active row in the live display:
+
+- shows `0%` remaining on the 5h window, or
+- shows `0%` remaining on the weekly window, or
+- shows a numeric non-`200` usage API status overlay
+
+Foreground live auto-switch candidates still use the same selectable rows as the live picker, so rows with usage/API error overlays are excluded. In addition, rows whose current displayed 5h or weekly value is already `0%` are skipped to avoid leaving one exhausted account for another exhausted account.
+
+When `switch --live --auto` is active, a successful manual live selection immediately re-enables the foreground auto-switch check on the patched current display instead of waiting for the next scheduled refresh. This is intentional: if the newly active row still shows an exhausted value or a numeric non-`200` usage overlay in the current display, the auto-switch loop may switch away again right away.
+
+When `--skip-api` or local-only usage mode is in effect, only the active account can be refreshed from local rollout data. Non-active candidates still come from the stored registry snapshot, so `switch --live --auto` is only as current as that local snapshot for non-active accounts.
+
+`codex-auth switch <query>` stays local-only: it resolves matches from the stored registry, switches immediately on a single match, and does not wait for foreground usage or account-name API refresh before switching. This query form does not accept `--live`, `--auto`, `--api`, or `--skip-api`.
 
 ## Removing Accounts
 
@@ -197,11 +218,9 @@ If exactly one account matches, it is removed immediately.
 If multiple accounts match in a TTY session, the command prints the matched account labels using the same display grouping as `list` and asks for confirmation with `Confirm delete? [y/N]:`; only `y` or `Y` proceeds.
 If multiple accounts match and stdin is not a TTY, the command exits non-zero instead of reading the pipe as confirmation input; the user must refine the query or rerun it interactively.
 
-Interactive `codex-auth remove` stays local-only by default, even when `api.usage = true`, so deletion is not blocked on foreground refresh work.
+Interactive `codex-auth remove`, including `remove --live`, stays local-only so deletion is not blocked on foreground refresh work.
 
-`codex-auth remove --api` performs a best-effort usage refresh attempt for picker display before rendering account choices, using a maximum concurrency of `3`. When per-account live results are available, the remove picker shows the same per-row usage overlays as `list` / interactive `switch`: successful rows show live usage data, while rows with non-`200` responses or missing auth can show status/error overlays such as `403` and `MissingAuth` in both usage columns. Refresh problems never block deletion: if the live refresh path cannot produce picker data, `remove` still uses the stored registry list, and attempted live refreshes may still emit setup warnings.
-
-`codex-auth remove --skip-api` keeps the interactive picker local-only explicitly.
+`codex-auth remove --live` patches the current live display in memory after each successful delete instead of rebuilding the picker from disk. The selected rows are removed immediately, the remaining row overlays stay in place until the next scheduled refresh, and the surviving active account is taken from the persisted `registry.json` state after removal/reconciliation. The `Removed ...` summary is also built from registry-backed labels rather than the stale pre-action in-memory display labels.
 
 In the interactive remove picker, `q` quits without deleting accounts.
 
@@ -316,6 +335,7 @@ Latest rollout `.jsonl` rate limit record shape (from an `event_msg` + `token_co
   - non-workspace duplicate plans (`Free`, `Plus`, `Pro`, `Pro Lite`) do not use `#1` / `#2`; they should use another disambiguator such as an account or user suffix
 - Single-account emails still render as one flat row; when an alias is set, that row shows `(alias)email`.
 - The switch/remove UI shows `ACCOUNT`, `PLAN`, `5H`, `WEEKLY`, `LAST`, and preserves grouped child indentation.
+- In `switch` and `remove`, typed row numbers are treated as an explicit manual override and resolve against displayed rows, not only the filtered arrow-key/live selectable set. This keeps environment/setup-error rows manually reachable when an operator intentionally enters the number.
 - Usage limit cells show remaining percent plus reset time: `NN% (HH:MM)` for same-day resets, or `NN% (HH:MM on D Mon)` when the reset is on a different day.
 - `LAST ACTIVITY` is derived from `last_usage_at` and rendered as a relative time like `Now` or `2m ago`.
 - `PLAN` comes from the auth claim when available, and falls back to the last usage snapshot's `plan_type` (for example raw values like `free`, `plus`, `prolite`, `team` are shown as `Free`, `Plus`, `Pro Lite`, `Team`).

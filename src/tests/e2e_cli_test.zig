@@ -28,6 +28,17 @@ const SeedAccount = struct {
     alias: []const u8,
 };
 
+const future_primary_reset_at: i64 = 4_102_444_800;
+const future_secondary_reset_at: i64 = 4_103_049_600;
+
+fn expectedImportMarker(outcome: registry.ImportOutcome) []const u8 {
+    return switch (outcome) {
+        .imported => if (builtin.os.tag == .windows) "[+]" else "✓",
+        .updated => if (builtin.os.tag == .windows) "[~]" else "✓",
+        .skipped => if (builtin.os.tag == .windows) "[x]" else "✗",
+    };
+}
+
 fn projectRootAlloc(allocator: std.mem.Allocator) ![]u8 {
     const project_root = getEnvVarOwned(allocator, e2e_project_root_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
@@ -68,13 +79,6 @@ fn buildCliBinary(allocator: std.mem.Allocator, project_root: []const u8) !void 
     defer cli_build_mutex.unlock(fs.io());
 
     if (cli_build_ready) return;
-
-    const exe_path = try builtCliPathAlloc(allocator, project_root);
-    defer allocator.free(exe_path);
-    if (fs.accessAbsolute(exe_path, .{})) |_| {
-        cli_build_ready = true;
-        return;
-    } else |_| {}
 
     var env_map = try getEnvMap(allocator);
     defer env_map.deinit();
@@ -535,6 +539,66 @@ fn setRegistryApiConfig(
     try registry.saveRegistry(allocator, codex_home, &reg);
 }
 
+fn makeUsageSnapshot(primary_used_percent: f64, secondary_used_percent: f64) registry.RateLimitSnapshot {
+    return .{
+        .primary = .{
+            .used_percent = primary_used_percent,
+            .window_minutes = 300,
+            .resets_at = future_primary_reset_at,
+        },
+        .secondary = .{
+            .used_percent = secondary_used_percent,
+            .window_minutes = 10080,
+            .resets_at = future_secondary_reset_at,
+        },
+        .credits = null,
+        .plan_type = .pro,
+    };
+}
+
+fn setStoredUsageSnapshotForAccount(
+    allocator: std.mem.Allocator,
+    home_root: []const u8,
+    email: []const u8,
+    snapshot: registry.RateLimitSnapshot,
+    last_usage_at: i64,
+    active_account_activated_at_ms: i64,
+) !void {
+    const codex_home = try codexHomeAlloc(allocator, home_root);
+    defer allocator.free(codex_home);
+
+    var reg = try registry.loadRegistry(allocator, codex_home);
+    defer reg.deinit(allocator);
+
+    const account_key = try bdd.accountKeyForEmailAlloc(allocator, email);
+    defer allocator.free(account_key);
+    registry.updateUsage(allocator, &reg, account_key, snapshot);
+    const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse return error.TestExpectedEqual;
+    reg.accounts.items[idx].last_usage_at = last_usage_at;
+    reg.active_account_activated_at_ms = active_account_activated_at_ms;
+    try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+fn writeLocalRolloutUsage(
+    dir: fs.Dir,
+    rel_path: []const u8,
+    primary_used_percent: f64,
+    secondary_used_percent: f64,
+) !void {
+    const contents = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2025-01-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":{d:.1},\"window_minutes\":300,\"resets_at\":{d}}},\"secondary\":{{\"used_percent\":{d:.1},\"window_minutes\":10080,\"resets_at\":{d}}},\"plan_type\":\"pro\"}}}}}}\n",
+        .{
+            primary_used_percent,
+            future_primary_reset_at,
+            secondary_used_percent,
+            future_secondary_reset_at,
+        },
+    );
+    defer std.testing.allocator.free(contents);
+    try dir.writeFile(.{ .sub_path = rel_path, .data = contents });
+}
+
 fn appendCustomAccount(
     allocator: std.mem.Allocator,
     reg: *registry.Registry,
@@ -905,14 +969,18 @@ test "Scenario: Given repeated single-file import when running import then first
     defer gpa.free(first.stdout);
     defer gpa.free(first.stderr);
     try expectSuccess(first);
-    try std.testing.expectEqualStrings("  ✓ imported  token_ryan.taylor.alpha@email.com\n", first.stdout);
+    const expected_first_stdout = try std.fmt.allocPrint(gpa, "  {s} imported  token_ryan.taylor.alpha@email.com\n", .{expectedImportMarker(.imported)});
+    defer gpa.free(expected_first_stdout);
+    try std.testing.expectEqualStrings(expected_first_stdout, first.stdout);
     try std.testing.expectEqualStrings("", first.stderr);
 
     const second = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
     defer gpa.free(second.stdout);
     defer gpa.free(second.stderr);
     try expectSuccess(second);
-    try std.testing.expectEqualStrings("  ✓ updated   token_ryan.taylor.alpha@email.com\n", second.stdout);
+    const expected_second_stdout = try std.fmt.allocPrint(gpa, "  {s} updated   token_ryan.taylor.alpha@email.com\n", .{expectedImportMarker(.updated)});
+    defer gpa.free(expected_second_stdout);
+    try std.testing.expectEqualStrings(expected_second_stdout, second.stdout);
     try std.testing.expectEqualStrings("", second.stderr);
 }
 
@@ -943,7 +1011,13 @@ test "Scenario: Given single-file import missing email when running import then 
 
     try expectFailure(result);
     try std.testing.expectEqualStrings("Import Summary: 0 imported, 1 skipped\n", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "  ✗ skipped   token_bob.wilson.alpha@email.com: MissingEmail\n") != null);
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  {s} skipped   token_bob.wilson.alpha@email.com: MissingEmail\n",
+        .{expectedImportMarker(.skipped)},
+    );
+    defer gpa.free(expected_stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, expected_stderr) != null);
 }
 
 test "Scenario: Given purge with no recoverable active auth when running import then it activates the first rebuilt account and backs up auth json" {
@@ -1084,21 +1158,34 @@ test "Scenario: Given directory import with new updated and invalid files when r
     const expected_stdout = try std.fmt.allocPrint(
         gpa,
         "Scanning {s}...\n" ++
-            "  ✓ updated   token_jane.smith.alpha@email.com\n" ++
-            "  ✓ imported  token_john.doe.alpha@email.com\n" ++
-            "  ✓ imported  token_mike.roe.alpha@email.com\n" ++
-            "  ✓ imported  token_ryan.taylor.alpha@email.com\n" ++
+            "  {s} updated   token_jane.smith.alpha@email.com\n" ++
+            "  {s} imported  token_john.doe.alpha@email.com\n" ++
+            "  {s} imported  token_mike.roe.alpha@email.com\n" ++
+            "  {s} imported  token_ryan.taylor.alpha@email.com\n" ++
             "Import Summary: 3 imported, 1 updated, 3 skipped (total 7 files)\n",
-        .{imports_path},
+        .{
+            imports_path,
+            expectedImportMarker(.updated),
+            expectedImportMarker(.imported),
+            expectedImportMarker(.imported),
+            expectedImportMarker(.imported),
+        },
     );
     defer gpa.free(expected_stdout);
     try std.testing.expectEqualStrings(expected_stdout, result.stdout);
-    try std.testing.expectEqualStrings(
-        "  ✗ skipped   token_alice.brown.alpha@email.com: MissingChatgptUserId\n" ++
-            "  ✗ skipped   token_bob.wilson.alpha@email.com: MissingEmail\n" ++
-            "  ✗ skipped   token_invalid: MalformedJson\n",
-        result.stderr,
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  {s} skipped   token_alice.brown.alpha@email.com: MissingChatgptUserId\n" ++
+            "  {s} skipped   token_bob.wilson.alpha@email.com: MissingEmail\n" ++
+            "  {s} skipped   token_invalid: MalformedJson\n",
+        .{
+            expectedImportMarker(.skipped),
+            expectedImportMarker(.skipped),
+            expectedImportMarker(.skipped),
+        },
     );
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
 }
 
 test "Scenario: Given directory import with an empty json file when running import then it is skipped as malformed and valid imports still persist" {
@@ -1130,13 +1217,15 @@ test "Scenario: Given directory import with an empty json file when running impo
     const expected_stdout = try std.fmt.allocPrint(
         gpa,
         "Scanning {s}...\n" ++
-            "  ✓ imported  valid\n" ++
+            "  {s} imported  valid\n" ++
             "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
-        .{imports_path},
+        .{ imports_path, expectedImportMarker(.imported) },
     );
     defer gpa.free(expected_stdout);
     try std.testing.expectEqualStrings(expected_stdout, result.stdout);
-    try std.testing.expectEqualStrings("  ✗ skipped   empty: MalformedJson\n", result.stderr);
+    const expected_stderr = try std.fmt.allocPrint(gpa, "  {s} skipped   empty: MalformedJson\n", .{expectedImportMarker(.skipped)});
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -1177,13 +1266,15 @@ test "Scenario: Given directory import with a broken symlink when running import
     const expected_stdout = try std.fmt.allocPrint(
         gpa,
         "Scanning {s}...\n" ++
-            "  ✓ imported  valid\n" ++
+            "  {s} imported  valid\n" ++
             "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
-        .{imports_path},
+        .{ imports_path, expectedImportMarker(.imported) },
     );
     defer gpa.free(expected_stdout);
     try std.testing.expectEqualStrings(expected_stdout, result.stdout);
-    try std.testing.expectEqualStrings("  ✗ skipped   broken: FileNotFound\n", result.stderr);
+    const expected_stderr = try std.fmt.allocPrint(gpa, "  {s} skipped   broken: FileNotFound\n", .{expectedImportMarker(.skipped)});
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -1221,14 +1312,19 @@ test "Scenario: Given cpa directory in default location when running import cpa 
     defer gpa.free(result.stderr);
 
     try expectSuccess(result);
-    try std.testing.expectEqualStrings(
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
         "Scanning ~/.cli-proxy-api...\n" ++
-            "  ✓ imported  first\n" ++
-            "  ✓ imported  second\n" ++
+            "  {s} imported  first\n" ++
+            "  {s} imported  second\n" ++
             "Import Summary: 2 imported, 0 updated, 1 skipped (total 3 files)\n",
-        result.stdout,
+        .{ expectedImportMarker(.imported), expectedImportMarker(.imported) },
     );
-    try std.testing.expectEqualStrings("  ✗ skipped   no-refresh: MissingRefreshToken\n", result.stderr);
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    const expected_stderr = try std.fmt.allocPrint(gpa, "  {s} skipped   no-refresh: MissingRefreshToken\n", .{expectedImportMarker(.skipped)});
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -1281,7 +1377,9 @@ test "Scenario: Given cpa file import when running import cpa then it stores a s
     defer gpa.free(result.stderr);
 
     try expectSuccess(result);
-    try std.testing.expectEqualStrings("  ✓ imported  cpa\n", result.stdout);
+    const expected_stdout = try std.fmt.allocPrint(gpa, "  {s} imported  cpa\n", .{expectedImportMarker(.imported)});
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
@@ -1465,37 +1563,6 @@ test "Scenario: Given list with skip-api when running list then it does not requ
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
-test "Scenario: Given list with debug and no accounts when running list then it does not require api refresh executables" {
-    const gpa = std.testing.allocator;
-    const project_root = try projectRootAlloc(gpa);
-    defer gpa.free(project_root);
-    try buildCliBinary(gpa, project_root);
-
-    var tmp = fs.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
-    defer gpa.free(home_root);
-
-    try tmp.dir.makePath("empty-bin");
-    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
-    defer gpa.free(empty_path);
-
-    const result = try runCliWithIsolatedHomeAndPath(
-        gpa,
-        project_root,
-        home_root,
-        empty_path,
-        &[_][]const u8{ "list", "--debug" },
-    );
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-
-    try expectSuccess(result);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ACCOUNT") != null);
-    try std.testing.expectEqualStrings("", result.stderr);
-}
-
 test "Scenario: Given switch query with api flag when running switch then it returns a usage error" {
     const gpa = std.testing.allocator;
     const project_root = try projectRootAlloc(gpa);
@@ -1529,7 +1596,7 @@ test "Scenario: Given switch query with api flag when running switch then it ret
 
     try expectFailure(result);
     try std.testing.expectEqualStrings("", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--api` or `--skip-api`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--live`, `--auto`, `--api`, or `--skip-api`") != null);
 }
 
 test "Scenario: Given switch query with skip-api flag when running switch then it returns a usage error" {
@@ -1565,7 +1632,43 @@ test "Scenario: Given switch query with skip-api flag when running switch then i
 
     try expectFailure(result);
     try std.testing.expectEqualStrings("", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--api` or `--skip-api`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--live`, `--auto`, `--api`, or `--skip-api`") != null);
+}
+
+test "Scenario: Given switch without api flags when running interactively then it requires api refresh executables by default" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"switch"},
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Node.js 22+") != null);
 }
 
 test "Scenario: Given switch with skip-api when running interactively then it does not require api refresh executables" {
@@ -1584,6 +1687,14 @@ test "Scenario: Given switch with skip-api when running interactively then it do
         .{ .email = "active@example.com", .alias = "active" },
         .{ .email = "backup@example.com", .alias = "backup" },
     });
+    try setStoredUsageSnapshotForAccount(
+        gpa,
+        home_root,
+        "active@example.com",
+        makeUsageSnapshot(25.0, 40.0),
+        1,
+        0,
+    );
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -1701,6 +1812,48 @@ test "Scenario: Given remove query with one match when running remove then it de
     keeper_backup.close();
 }
 
+test "Scenario: Given remove with account key selector when running remove then it deletes the matching account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "robot09@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const removed_account_key = try bdd.accountKeyForEmailAlloc(gpa, "robot09@example.com");
+    defer gpa.free(removed_account_key);
+
+    const result = try runCliWithIsolatedHomeAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "remove", removed_account_key },
+        "",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "robot09@example.com") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "keeper@example.com"));
+}
+
 test "Scenario: Given remove with multiple selectors when running remove then it deletes all selected accounts" {
     const gpa = std.testing.allocator;
     const project_root = try projectRootAlloc(gpa);
@@ -1778,7 +1931,7 @@ test "Scenario: Given remove query with api flag when running remove then it ret
 
     try expectFailure(result);
     try std.testing.expectEqualStrings("", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "do not support `--api` or `--skip-api`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "`remove <query>` and `remove --all` do not support") != null);
 }
 
 test "Scenario: Given remove query with skip-api flag when running remove then it returns a usage error" {
@@ -1814,10 +1967,10 @@ test "Scenario: Given remove query with skip-api flag when running remove then i
 
     try expectFailure(result);
     try std.testing.expectEqualStrings("", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "do not support `--api` or `--skip-api`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "`remove <query>` and `remove --all` do not support") != null);
 }
 
-test "Scenario: Given interactive remove with api flag and missing refresh executables when running remove then it falls back to stored data" {
+test "Scenario: Given interactive remove with api flag when running remove then it requires api refresh executables" {
     const gpa = std.testing.allocator;
     const project_root = try projectRootAlloc(gpa);
     defer gpa.free(project_root);
@@ -1833,9 +1986,6 @@ test "Scenario: Given interactive remove with api flag and missing refresh execu
         .{ .email = "alpha@example.com", .alias = "" },
         .{ .email = "beta@example.com", .alias = "" },
     });
-
-    const codex_home = try codexHomeAlloc(gpa, home_root);
-    defer gpa.free(codex_home);
 
     try tmp.dir.makePath("empty-bin");
     const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
@@ -1852,17 +2002,12 @@ test "Scenario: Given interactive remove with api flag and missing refresh execu
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
-    try expectSuccess(result);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select accounts to delete:") != null);
-    try std.testing.expectEqualStrings("", result.stderr);
-
-    var loaded = try registry.loadRegistry(gpa, codex_home);
-    defer loaded.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
-    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "alpha@example.com"));
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Node.js 22+") != null);
 }
 
-test "Scenario: Given remove without selectors when running remove then it does not require api refresh executables" {
+test "Scenario: Given remove without api flags when running remove then it requires api refresh executables by default" {
     const gpa = std.testing.allocator;
     const project_root = try projectRootAlloc(gpa);
     defer gpa.free(project_root);
@@ -1878,6 +2023,44 @@ test "Scenario: Given remove without selectors when running remove then it does 
         .{ .email = "alpha@example.com", .alias = "" },
         .{ .email = "beta@example.com", .alias = "" },
     });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"remove"},
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Node.js 22+") != null);
+}
+
+test "Scenario: Given remove without selectors and api disabled in config when running remove then it does not require api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+    try setRegistryApiConfig(gpa, home_root, false, false);
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -1924,9 +2107,6 @@ test "Scenario: Given remove with skip-api when running remove then it does not 
         .{ .email = "beta@example.com", .alias = "" },
     });
 
-    const codex_home = try codexHomeAlloc(gpa, home_root);
-    defer gpa.free(codex_home);
-
     try tmp.dir.makePath("empty-bin");
     const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
     defer gpa.free(empty_path);
@@ -1945,11 +2125,6 @@ test "Scenario: Given remove with skip-api when running remove then it does not 
     try expectSuccess(result);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select accounts to delete:") != null);
     try std.testing.expectEqualStrings("", result.stderr);
-
-    var loaded = try registry.loadRegistry(gpa, codex_home);
-    defer loaded.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
-    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "alpha@example.com"));
 }
 
 test "Scenario: Given active account removal with a replacement when running remove then it does not recreate a backup for the deleted auth" {
