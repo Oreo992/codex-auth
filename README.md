@@ -88,6 +88,11 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 )
 ```
 
+## macOS Status Bar Companion
+
+This repository includes an experimental lightweight macOS status bar companion for quick account switching and usage checks.
+See [docs/macos-statusbar.md](docs/macos-statusbar.md).
+
 ## Commands
 
 ### Account Management

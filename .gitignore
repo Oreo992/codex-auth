@@ -4,6 +4,9 @@ zig-out/
 dist/
 *.tgz
 
+# Swift build artifacts
+.build/
+
 # IDE/Editor
 .idea/
 
