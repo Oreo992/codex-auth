@@ -2,12 +2,18 @@ name: Preview Release
 
 on:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: preview-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   release-assets:
+    if: github.repository == 'Loongphy/codex-auth'
     name: Build Preview Packages (${{ matrix.id }})
     runs-on: ubuntu-latest
     strategy:
@@ -61,6 +67,7 @@ jobs:
           path: artifacts
 
   publish-preview:
+    if: github.repository == 'Loongphy/codex-auth'
     name: Publish Preview Packages
     runs-on: ubuntu-latest
     needs: release-assets
