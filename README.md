@@ -1,8 +1,20 @@
-# Codex Auth [![latest release](https://img.shields.io/github/v/release/Loongphy/codex-auth?sort=semver&label=latest)](https://github.com/Loongphy/codex-auth/releases/latest) [![latest pre-release](https://img.shields.io/github/v/release/Loongphy/codex-auth?include_prereleases&sort=semver&filter=*-*&label=pre-release)](https://github.com/Loongphy/codex-auth/releases)
+# Codex Auth macOS Status Bar Edition [![latest release](https://img.shields.io/github/v/release/Oreo992/codex-auth?sort=semver&label=latest)](https://github.com/Oreo992/codex-auth/releases/latest) [![latest pre-release](https://img.shields.io/github/v/release/Oreo992/codex-auth?include_prereleases&sort=semver&filter=*-*&label=pre-release)](https://github.com/Oreo992/codex-auth/releases)
 
 ![command list](https://github.com/user-attachments/assets/6c13a2d6-f9da-47ea-8ec8-0394fc072d40)
 
-`codex-auth` is a command-line tool for switching Codex accounts.
+This is a special macOS edition of [`codex-auth`](https://github.com/Loongphy/codex-auth), based on the original project with an added native macOS status bar companion.
+
+The original `codex-auth` CLI is still included for switching and managing Codex accounts. This edition adds a lightweight menu bar app for quick account switching, usage refresh, and adding accounts from the panel.
+
+## What's Different
+
+- Adds `CodexAuthStatusBar.app`, a native macOS menu bar companion.
+- Shows stored accounts, the active account, and remaining 5h/weekly usage.
+- Switches accounts from the menu bar by calling the existing `codex-auth switch` command.
+- Adds accounts from the menu bar by calling `codex-auth login`.
+- Keeps the original CLI workflow and repository structure intact.
+
+Upstream project: [`Loongphy/codex-auth`](https://github.com/Loongphy/codex-auth)
 
 > [!IMPORTANT]
 > For **Codex CLI** and **Codex App** users, switch accounts, then restart the client for the new account to take effect.
@@ -27,7 +39,20 @@ After that, you can use `codex login`, `codex login --device-auth`, `codex-auth 
 
 ## Install
 
-Install with npm:
+### macOS Status Bar App
+
+Download the app zip from this repository's [Releases](https://github.com/Oreo992/codex-auth/releases):
+
+- [CodexAuthStatusBar-macos.zip](https://github.com/Oreo992/codex-auth/releases/download/macos-statusbar-v0.3.0-alpha.2/CodexAuthStatusBar-macos.zip)
+
+Unzip it and open `CodexAuthStatusBar.app`.
+
+> [!NOTE]
+> The status bar app uses the `codex-auth` CLI underneath. Install the CLI with npm, or set `CODEX_AUTH_BIN` to the path of your `codex-auth` executable.
+
+### CLI
+
+Install the original CLI package with npm:
 
 ```shell
 npm install -g @loongphy/codex-auth
