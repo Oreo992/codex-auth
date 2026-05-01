@@ -7,6 +7,7 @@ enum AccountListParserSelfTest {
         parsesCodexAuthListRows()
         parsesGroupedAccountLabels()
         emptyOutputReturnsNoRows()
+        loginCommandUsesCodexAuthLogin()
         print("CodexAuthStatusBarSelfTest passed")
     }
 
@@ -56,6 +57,10 @@ enum AccountListParserSelfTest {
 
     private static func emptyOutputReturnsNoRows() {
         expect(AccountListParser.parse("").isEmpty, "expected empty output to return no rows")
+    }
+
+    private static func loginCommandUsesCodexAuthLogin() {
+        expect(CodexAuthCLI.loginArguments() == ["login"], "expected add account to run codex-auth login")
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) {

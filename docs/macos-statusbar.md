@@ -9,6 +9,7 @@ It keeps account switching in the existing CLI and adds a small native panel for
 - Opens a small translucent macOS panel with the active account, 5h usage, weekly usage, and last activity.
 - Shows 5h and weekly remaining usage as slim progress bars beside each account.
 - Colors usage bars green by default, yellow below 50%, and red below 20%.
+- Adds accounts from the panel by running `codex-auth login`, then refreshes the list.
 - Lists stored accounts from `codex-auth list --skip-api`.
 - Refreshes usage on demand with `codex-auth list --api`.
 - Switches accounts by clicking a row, which calls `codex-auth switch <email-or-account-label>`.

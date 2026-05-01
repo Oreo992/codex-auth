@@ -72,6 +72,17 @@ public struct CodexAuthCLI: CommandRunning {
         }
     }
 
+    public func login() async throws {
+        let result = try await run(arguments: Self.loginArguments())
+        guard result.status == 0 else {
+            throw CodexAuthCLIError.commandFailed(Self.message(from: result))
+        }
+    }
+
+    public static func loginArguments() -> [String] {
+        ["login"]
+    }
+
     private static func findExecutable() -> String? {
         let environment = ProcessInfo.processInfo.environment
         var candidates: [String] = []

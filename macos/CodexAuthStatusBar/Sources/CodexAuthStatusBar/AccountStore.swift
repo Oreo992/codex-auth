@@ -8,6 +8,7 @@ final class AccountStore: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var switchingIndex: String?
+    @Published private(set) var isAddingAccount = false
     @Published private(set) var panelHeight: Double = 150
 
     var onActiveSummaryChange: ((String) -> Void)?
@@ -54,6 +55,21 @@ final class AccountStore: ObservableObject {
             errorMessage = error.localizedDescription
         }
         switchingIndex = nil
+        updatePanelHeight()
+    }
+
+    func addAccount() async {
+        guard let cli else { return }
+        isAddingAccount = true
+        errorMessage = nil
+        do {
+            try await cli.login()
+            await refresh(refreshFromAPI: false)
+        } catch {
+            errorMessage = error.localizedDescription
+            updateStatusTitle()
+        }
+        isAddingAccount = false
         updatePanelHeight()
     }
 

@@ -31,20 +31,26 @@ struct AccountPanelView: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 6) {
+                CompactIconButton(systemName: "person.crop.circle.badge.plus", help: "Add account") {
+                    Task { await store.addAccount() }
+                }
+                .disabled(store.isLoading || store.isAddingAccount)
+
                 CompactIconButton(systemName: "arrow.clockwise", help: "Refresh locally") {
                     Task { await store.refresh(refreshFromAPI: false) }
                 }
-                .disabled(store.isLoading)
+                .disabled(store.isLoading || store.isAddingAccount)
 
                 CompactIconButton(systemName: "waveform.path.ecg", help: "Refresh usage from API") {
                     Task { await store.refresh(refreshFromAPI: true) }
                 }
-                .disabled(store.isLoading)
+                .disabled(store.isLoading || store.isAddingAccount)
             }
         }
     }
 
     private var activeSubtitle: String {
+        if store.isAddingAccount { return "Adding account..." }
         if store.isLoading { return "Refreshing..." }
         guard let row = store.activeRow else { return "No active account" }
         return row.switchSelector
